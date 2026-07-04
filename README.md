@@ -14,22 +14,25 @@ beacon/
                 encrypted token store, mail API proxy, pagination, SSE sync.
 ```
 
-## Run the frontend
+## Quick start (npm workspaces)
+
+One install from the repo root sets up both halves:
 
 ```bash
-cd frontend
-npm install
-npm run dev        # http://localhost:5173
+npm install        # installs frontend + backend dependencies
+npm run dev        # starts both: frontend on :5173, backend on :4000
 ```
 
-## Run the backend
+Or run either side alone:
 
 ```bash
-cd backend
-npm install
-cp .env.example .env   # fill in secrets + provider credentials (see backend/README.md)
-npm run dev            # http://localhost:4000
+npm run dev:frontend   # just the UI (mock data — no backend needed)
+npm run dev:backend    # just the API server
 ```
+
+The backend boots with safe dev defaults; to use real providers,
+`cp backend/.env.example backend/.env` and fill in credentials
+(see backend/README.md).
 
 The frontend currently uses mock data. To connect it to the backend, swap the
 mock `mailService` in `frontend/src/Beacon.jsx` for
