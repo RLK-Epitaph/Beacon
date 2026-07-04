@@ -1,0 +1,26 @@
+{
+  "name": "beacon-backend",
+  "version": "1.0.0",
+  "description": "OAuth + mail-API proxy backend for the Beacon client (Google, Microsoft, Apple/iCloud)",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "googleapis": "^140.0.1",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.1",
+    "nodemailer": "^6.9.14",
+    "undici": "^6.19.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

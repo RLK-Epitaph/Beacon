@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: .
+    image: beacon-backend
+    container_name: beacon-backend
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    # Reads secrets + provider credentials from your .env file.
+    env_file:
+      - .env
+    environment:
+      # Override here if you don't want these in .env
+      NODE_ENV: production
+      PORT: "4000"
+    volumes:
+      # Persist the encrypted token store across restarts/rebuilds.
+      - beacon-data:/app/.data
+
+volumes:
+  beacon-data:
