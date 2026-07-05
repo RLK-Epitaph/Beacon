@@ -43,6 +43,17 @@ function headerVal(headers, name) {
   return headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || "";
 }
 
+function parseAddrList(value) {
+  // "A <a@x.com>, b@y.com" → ["a@x.com", "b@y.com"]
+  return (value || "")
+    .split(",")
+    .map((part) => {
+      const m = part.match(/<([^>]+)>/);
+      return (m ? m[1] : part).trim();
+    })
+    .filter(Boolean);
+}
+
 function parseFrom(value) {
   // "Jane Doe <jane@x.com>" → { name, addr }
   const m = value.match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/);
@@ -153,8 +164,9 @@ export const googleProvider = {
     const headers = msg.payload?.headers || [];
     const from = parseFrom(headerVal(headers, "From"));
 
-    // Walk parts for the text/plain (or html) body + attachment names.
+    // Walk parts for text/plain AND text/html bodies + attachment names.
     let body = "";
+    let bodyHtml = "";
     const attachments = [];
     const walk = (part) => {
       if (!part) return;
@@ -164,20 +176,28 @@ export const googleProvider = {
       if (part.mimeType === "text/plain" && part.body?.data) {
         body += Buffer.from(part.body.data, "base64").toString("utf8");
       }
+      if (part.mimeType === "text/html" && part.body?.data) {
+        bodyHtml += Buffer.from(part.body.data, "base64").toString("utf8");
+      }
       (part.parts || []).forEach(walk);
     };
     walk(msg.payload);
-    if (!body && msg.payload?.body?.data) {
-      body = Buffer.from(msg.payload.body.data, "base64").toString("utf8");
+    if (!body && !bodyHtml && msg.payload?.body?.data) {
+      const raw = Buffer.from(msg.payload.body.data, "base64").toString("utf8");
+      if (msg.payload.mimeType === "text/html") bodyHtml = raw;
+      else body = raw;
     }
 
     return {
       id: msg.id,
       from: from.name,
       fromAddr: from.addr,
+      to: parseAddrList(headerVal(headers, "To")),
+      cc: parseAddrList(headerVal(headers, "Cc")),
       subject: headerVal(headers, "Subject") || "(no subject)",
       fullDate: headerVal(headers, "Date"),
       body: body || msg.snippet || "",
+      bodyHtml: bodyHtml || null,
       unread: (msg.labelIds || []).includes("UNREAD"),
       starred: (msg.labelIds || []).includes("STARRED"),
       attachments,
@@ -193,6 +213,28 @@ export const googleProvider = {
     });
   },
 
+  // Move a message: Gmail models folders as labels, trash/spam as endpoints.
+  async move(account, id, dest) {
+    const gmail = clientForAccount(account);
+    if (dest === "trash") {
+      await gmail.users.messages.trash({ userId: "me", id });
+      return;
+    }
+    if (dest === "inbox") {
+      try { await gmail.users.messages.untrash({ userId: "me", id }); } catch { /* not in trash */ }
+      await gmail.users.messages.modify({
+        userId: "me", id,
+        requestBody: { addLabelIds: ["INBOX"], removeLabelIds: ["SPAM"] },
+      });
+      return;
+    }
+    const addLabelIds = dest === "spam" ? ["SPAM"] : [];
+    await gmail.users.messages.modify({
+      userId: "me", id,
+      requestBody: { addLabelIds, removeLabelIds: ["INBOX"] }, // archive = leave INBOX
+    });
+  },
+
   async toggleStar(account, id, starred) {
     const gmail = clientForAccount(account);
     await gmail.users.messages.modify({
@@ -202,10 +244,17 @@ export const googleProvider = {
     });
   },
 
-  async send(account, { to, subject, body }) {
+  async send(account, { to, subject, body, html }) {
     const gmail = clientForAccount(account);
     const raw = Buffer.from(
-      [`To: ${to}`, `Subject: ${subject}`, "Content-Type: text/plain; charset=utf-8", "", body].join("\r\n")
+      [
+        `To: ${to}`,
+        `Subject: ${subject}`,
+        "MIME-Version: 1.0",
+        `Content-Type: ${html ? "text/html" : "text/plain"}; charset=utf-8`,
+        "",
+        html || body,
+      ].join("\r\n")
     ).toString("base64url");
     await gmail.users.messages.send({ userId: "me", requestBody: { raw } });
   },

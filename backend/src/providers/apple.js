@@ -134,9 +134,12 @@ export const appleProvider = {
           id: String(id),
           from: parsed.from?.value?.[0]?.name || "",
           fromAddr: parsed.from?.value?.[0]?.address || "",
+          to: (parsed.to?.value || []).map((v) => v.address).filter(Boolean),
+          cc: (parsed.cc?.value || []).map((v) => v.address).filter(Boolean),
           subject: parsed.subject || "(no subject)",
           fullDate: parsed.date ? parsed.date.toLocaleString() : "",
           body: parsed.text || stripHtml(parsed.html || ""),
+          bodyHtml: parsed.html || null,
           unread: !msg.flags?.has("\\Seen"),
           starred: msg.flags?.has("\\Flagged") || false,
           attachments: (parsed.attachments || []).map((a) => ({
@@ -163,6 +166,19 @@ export const appleProvider = {
     });
   },
 
+  async move(account, id, dest, folder = "inbox") {
+    const source = FOLDER_MAP[folder] || "INBOX";
+    const target = FOLDER_MAP[dest] || "INBOX";
+    return withClient(account, async (client) => {
+      const lock = await client.getMailboxLock(source);
+      try {
+        await client.messageMove(id, target, { uid: true });
+      } finally {
+        lock.release();
+      }
+    });
+  },
+
   async toggleStar(account, id, starred, folder = "inbox") {
     const mailbox = FOLDER_MAP[folder] || "INBOX";
     return withClient(account, async (client) => {
@@ -176,7 +192,7 @@ export const appleProvider = {
     });
   },
 
-  async send(account, { to, subject, body }) {
+  async send(account, { to, subject, body, html }) {
     const transport = nodemailer.createTransport({
       host: config.apple.smtpHost,
       port: config.apple.smtpPort,
@@ -184,7 +200,10 @@ export const appleProvider = {
       requireTLS: true,
       auth: { user: account.secrets.address, pass: account.secrets.app_password },
     });
-    await transport.sendMail({ from: account.secrets.address, to, subject, text: body });
+    await transport.sendMail({
+      from: account.secrets.address, to, subject,
+      text: body, ...(html ? { html } : {}),
+    });
   },
 };
 

@@ -5,7 +5,9 @@ import {
   Forward, MoreHorizontal, Paperclip, X, RefreshCw, CircleDot,
   ChevronsLeft, ChevronsRight, SmilePlus,
   Home, Calendar as CalendarIcon, Cloud, CloudSun, Sun, CloudRain,
-  CheckSquare, Square, ListTodo, MapPin, Clock, Users, MessageSquare
+  CheckSquare, Square, ListTodo, MapPin, Clock, Users, MessageSquare,
+  List, ListOrdered, AlignLeft, AlignCenter, AlignRight,
+  IndentIncrease, IndentDecrease, Quote, RemoveFormatting, MailOpen
 } from "lucide-react";
 
 /* =============================================================================
@@ -607,12 +609,25 @@ const BACKEND = import.meta.env?.VITE_BACKEND_URL || null;
 async function backendApi(path, options = {}) {
   const res = await fetch(`${BACKEND}${path}`, {
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      // ngrok's free tier intercepts requests with an HTML warning page unless
+      // this header is present — without it, API calls randomly "fail" after
+      // cold starts (looking like logouts or stale/empty data).
+      "ngrok-skip-browser-warning": "true",
+      ...(options.headers || {}),
+    },
     ...options,
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Request failed: ${res.status}`);
+  const isJson = (res.headers.get("content-type") || "").includes("application/json");
+  if (!res.ok || !isJson) {
+    const body = isJson ? await res.json().catch(() => ({})) : {};
+    throw new Error(
+      body.error ||
+        (!isJson
+          ? "Backend returned a non-JSON response (tunnel interstitial or server offline)"
+          : `Request failed: ${res.status}`)
+    );
   }
   return res.json();
 }
@@ -745,6 +760,21 @@ const liveMailService = {
       body: JSON.stringify({ starred, folder }),
     });
   },
+  async send(accountId, { to, subject, body, html }) {
+    await backendApi(`/api/accounts/${accountId}/send`, {
+      method: "POST",
+      body: JSON.stringify({ to, subject, body, html }),
+    });
+  },
+  async refresh(accountId) {
+    return backendApi(`/api/accounts/${accountId}/refresh`, { method: "POST" });
+  },
+  async move(accountId, id, dest, folder) {
+    await backendApi(`/api/accounts/${accountId}/messages/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ move: dest, folder }),
+    });
+  },
 };
 
 const slackAPI = BACKEND ? liveSlackService : slackService;
@@ -807,6 +837,20 @@ const calendarService = {
 
 /* -------------------------------- helpers --------------------------------- */
 
+// Wrap an email's HTML for a sandboxed iframe: scripts are blocked by the
+// sandbox, links open in a new tab, and images are constrained to the pane.
+function emailHtmlDoc(html) {
+  return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank">
+<style>
+  body{margin:0;padding:4px 2px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+       font-size:14px;line-height:1.6;color:#2c3138;word-break:break-word}
+  img{max-width:100%;height:auto}
+  table{max-width:100%}
+  a{color:#3b5bdb}
+  blockquote{border-left:3px solid #e7eaee;margin:8px 0;padding:2px 0 2px 12px;color:#5b6470}
+</style></head><body>${html}</body></html>`;
+}
+
 function initials(addr) {
   const name = addr.split("@")[0].replace(/[._]/g, " ");
   return name.split(" ").filter(Boolean).slice(0, 2).map((s) => s[0].toUpperCase()).join("");
@@ -833,6 +877,10 @@ export default function Beacon() {
   const [connecting, setConnecting] = useState(null);
   const [showConnect, setShowConnect] = useState(false);
   const [appleForm, setAppleForm] = useState(null);
+  // Live unread counts pushed by the backend poller over SSE: { accId: { folderId: n } }
+  const [liveUnread, setLiveUnread] = useState({});
+  // Slack workspace unread from the backend poller: { accountId: { total, byChannel } }
+  const [liveSlackUnread, setLiveSlackUnread] = useState({});
   const [editingLabel, setEditingLabel] = useState(null);
   const [composing, setComposing] = useState(false);
   const [railExpanded, setRailExpanded] = useState(false);
@@ -867,6 +915,51 @@ export default function Beacon() {
       .then(setProfile)
       .catch((e) => console.warn("Profile load failed:", e.message))
       .finally(() => setProfileLoaded(true));
+  }, []);
+
+  // Track the active view in a ref so the long-lived SSE handler always sees
+  // the current selection without re-subscribing.
+  const activeViewRef = useRef({});
+  activeViewRef.current = { activeAccountId, activeFolder };
+
+  // Real-time: subscribe to the backend's unread-change stream. When the
+  // account being viewed changes, refetch its open folder so new mail appears
+  // without any clicking around.
+  useEffect(() => {
+    if (!BACKEND) return;
+    const es = new EventSource(`${BACKEND}/api/events`, { withCredentials: true });
+    es.addEventListener("change", (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.kind === "slack") {
+          // Notification: update the workspace badge + per-channel dots, and
+          // reflect counts onto the loaded channel list so unread shows inline.
+          setLiveSlackUnread((prev) => ({
+            ...prev,
+            [payload.accountId]: { total: payload.slackUnread || 0, byChannel: payload.byChannel || {} },
+          }));
+          setWorkspaces((prev) =>
+            prev.map((w) =>
+              w.id === payload.accountId
+                ? {
+                    ...w,
+                    channels: w.channels.map((c) => ({
+                      ...c,
+                      unread: payload.byChannel?.[c.id] ?? 0,
+                    })),
+                  }
+                : w
+            )
+          );
+          return;
+        }
+        // Mail change event
+        setLiveUnread((prev) => ({ ...prev, [payload.accountId]: payload.folders || {} }));
+        const { activeAccountId: aid, activeFolder: af } = activeViewRef.current;
+        if (payload.accountId === aid) refetchFolder(aid, af);
+      } catch { /* malformed frame */ }
+    });
+    return () => es.close();
   }, []);
 
   // Handle the OAuth bounce-back (?connect=ok&account=...) from the backend.
@@ -935,10 +1028,13 @@ export default function Beacon() {
   const unreadByAccount = useMemo(() => {
     const map = {};
     for (const a of accounts) {
-      map[a.id] = (a.messages || []).filter((m) => m.unread && m.folder === "inbox").length;
+      map[a.id] =
+        BACKEND && liveUnread[a.id]
+          ? liveUnread[a.id].inbox || 0
+          : (a.messages || []).filter((m) => m.unread && m.folder === "inbox").length;
     }
     return map;
-  }, [accounts]);
+  }, [accounts, liveUnread]);
 
   const folderMessages = useMemo(() => {
     if (!activeAccount) return [];
@@ -966,19 +1062,46 @@ export default function Beacon() {
       c[f.id] =
         f.id === "starred"
           ? (activeAccount.messages || []).filter((m) => m.starred).length
+          : BACKEND && liveUnread[activeAccount.id]
+          ? liveUnread[activeAccount.id][f.id] || 0
           : (activeAccount.messages || []).filter((m) => m.unread && m.folder === f.id).length;
     }
     return c;
-  }, [activeAccount]);
+  }, [activeAccount, liveUnread]);
 
   // Total unread per Slack workspace (sum across its channels).
+  // Email accounts grouped by their user-set label; labeled groups sorted
+  // alphabetically, unlabeled accounts together as one group at the end.
+  const emailGroups = useMemo(() => {
+    const byLabel = new Map();
+    for (const a of accounts) {
+      const key = (a.label || "").trim();
+      if (!byLabel.has(key)) byLabel.set(key, []);
+      byLabel.get(key).push(a);
+    }
+    const labeled = [...byLabel.entries()]
+      .filter(([k]) => k)
+      .sort((x, y) => x[0].localeCompare(y[0]))
+      .map(([k, accs]) => ({ key: k, title: k, accounts: accs }));
+    const unlabeled = byLabel.get("") || [];
+    if (unlabeled.length) {
+      labeled.push({ key: "__none", title: labeled.length ? "Other" : "Email", accounts: unlabeled });
+    }
+    return labeled;
+  }, [accounts]);
+
   const unreadByWorkspace = useMemo(() => {
     const map = {};
     for (const w of workspaces) {
-      map[w.id] = w.channels.reduce((sum, c) => sum + (c.unread || 0), 0);
+      // Prefer the backend poller's total when we have it; fall back to summing
+      // whatever channel data is currently loaded.
+      map[w.id] =
+        BACKEND && liveSlackUnread[w.id]
+          ? liveSlackUnread[w.id].total
+          : w.channels.reduce((sum, c) => sum + (c.unread || 0), 0);
     }
     return map;
-  }, [workspaces]);
+  }, [workspaces, liveSlackUnread]);
 
   // Active Slack channel + its thread, when a workspace is open.
   const activeChannel = useMemo(() => {
@@ -1026,7 +1149,41 @@ export default function Beacon() {
     }
   }
 
+  // Force-fetch a folder and REPLACE its messages (used by SSE + refresh).
+  async function refetchFolder(accountId, folder) {
+    if (!BACKEND) return;
+    try {
+      const fetched = await liveMailService.listFolderMessages(accountId, folder);
+      setAccounts((prev) =>
+        prev.map((a) =>
+          a.id === accountId
+            ? {
+                ...a,
+                messages: [
+                  ...(a.messages || []).filter((m) => (m.folder || "inbox") !== folder),
+                  ...fetched,
+                ],
+                _loadedFolders: { ...(a._loadedFolders || {}), [folder]: true },
+              }
+            : a
+        )
+      );
+    } catch (e) {
+      console.warn("Refresh failed:", e.message);
+    }
+  }
+
+  function refreshCurrentFolder() {
+    if (!BACKEND || !activeAccount) return;
+    refetchFolder(activeAccountId, activeFolder);
+    liveMailService
+      .refresh(activeAccountId)
+      .then((r) => setLiveUnread((prev) => ({ ...prev, [activeAccountId]: r.folders || {} })))
+      .catch(() => {});
+  }
+
   function selectItem(id) {
+    setShowProfile(false); // leaving profile/settings for an account view
     setActiveAccountId(id);
     setSelectedId(null);
     setQuery("");
@@ -1459,11 +1616,63 @@ export default function Beacon() {
     }
   }
 
+  // Move a message to archive/spam/trash/inbox: optimistic local re-folder,
+  // then the provider call. Closes the reader if it was showing this message.
+  function moveMessage(m, dest) {
+    if (BACKEND) {
+      liveMailService.move(activeAccountId, m.id, dest, m.folder || activeFolder).catch((e) => console.warn(e.message));
+    }
+    setAccounts((prev) =>
+      prev.map((a) =>
+        a.id === activeAccountId
+          ? { ...a, messages: (a.messages || []).map((x) => (x.id === m.id ? { ...x, folder: dest } : x)) }
+          : a
+      )
+    );
+    if (selectedId === m.id) setSelectedId(null);
+  }
+
+  function markMessageRead(m, read) {
+    if (BACKEND) {
+      liveMailService.markRead(activeAccountId, m.id, read, m.folder || activeFolder).catch(() => {});
+    } else {
+      mailService.markRead(m.id);
+    }
+    setAccounts((prev) =>
+      prev.map((a) =>
+        a.id === activeAccountId
+          ? { ...a, messages: (a.messages || []).map((x) => (x.id === m.id ? { ...x, unread: !read } : x)) }
+          : a
+      )
+    );
+    if (!read && selectedId === m.id) setSelectedId(null);
+  }
+
+  async function sendEmailReply(orig, { to, subject, html, text }) {
+    if (BACKEND) {
+      await liveMailService.send(activeAccountId, { to, subject, body: text, html });
+    } else {
+      // Mock mode: drop a copy in the Sent folder so the flow feels real.
+      const sentMsg = msg("Me", activeAccount.address, subject, text.slice(0, 80), text, {
+        folder: "sent", date: "now", fullDate: "Just now",
+      });
+      setAccounts((prev) =>
+        prev.map((a) => (a.id === activeAccountId ? { ...a, messages: [...a.messages, sentMsg] } : a))
+      );
+    }
+  }
+
   function saveLabel(id, value) {
     setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, label: value } : a)));
     setWorkspaces((prev) => prev.map((w) => (w.id === id ? { ...w, label: value } : w)));
     setTeamsOrgs((prev) => prev.map((t) => (t.id === id ? { ...t, label: value } : t)));
     setEditingLabel(null);
+    // Persist for backend-stored accounts (mail + Slack). Teams is mock-only,
+    // and unknown ids 404 harmlessly.
+    if (BACKEND) {
+      backendApi(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ label: value }) })
+        .catch(() => {});
+    }
   }
 
   return (
@@ -1496,8 +1705,11 @@ export default function Beacon() {
         </button>
 
         <div className="rail-accounts">
-          {railExpanded && <span className="rail-section-label">Email</span>}
-          {accounts.map((a) => {
+          {emailGroups.map((g, gi) => (
+            <React.Fragment key={g.key}>
+              {!railExpanded && gi > 0 && <div className="rail-group-gap" />}
+              {railExpanded && <span className="rail-section-label">{g.title}</span>}
+              {g.accounts.map((a) => {
             const p = PROVIDERS[a.provider];
             const unread = unreadByAccount[a.id] || 0;
             const active = a.id === activeAccountId;
@@ -1529,7 +1741,9 @@ export default function Beacon() {
                 )}
               </button>
             );
-          })}
+              })}
+            </React.Fragment>
+          ))}
 
           {/* separator between email and slack */}
           <div className="rail-sep" />
@@ -1757,6 +1971,7 @@ export default function Beacon() {
           workspaces={workspaces}
           teamsOrgs={teamsOrgs}
           onDisconnect={disconnectAccount}
+          onSetLabel={saveLabel}
           onLogout={logout}
           onBack={goHome}
           live={!!BACKEND}
@@ -1803,7 +2018,7 @@ export default function Beacon() {
         <header className="list-head">
           <div className="list-title">
             <h1>{FOLDERS.find((f) => f.id === activeFolder)?.name}</h1>
-            <button className="refresh" title="Refresh">
+            <button className="refresh" title="Refresh" onClick={refreshCurrentFolder}>
               <RefreshCw size={15} />
             </button>
           </div>
@@ -1860,6 +2075,36 @@ export default function Beacon() {
                   {m.attachments.length > 0 && <Paperclip size={13} className="row-clip" />}
                   {m.unread && <CircleDot size={9} className="row-unread-dot" />}
                 </div>
+
+                {/* hover quick actions — spans with button role (the row itself is a button) */}
+                <div className="row-actions" onClick={(e) => e.stopPropagation()}>
+                  <span
+                    role="button" tabIndex={0} className="row-act"
+                    title={m.unread ? "Mark as read" : "Mark as unread"}
+                    aria-label={m.unread ? "Mark as read" : "Mark as unread"}
+                    onClick={() => markMessageRead(m, m.unread)}
+                  >
+                    {m.unread ? <MailOpen size={15} /> : <Mail size={15} />}
+                  </span>
+                  <span
+                    role="button" tabIndex={0} className="row-act" title="Archive" aria-label="Archive"
+                    onClick={() => moveMessage(m, "archive")}
+                  >
+                    <Archive size={15} />
+                  </span>
+                  <span
+                    role="button" tabIndex={0} className="row-act" title="Mark as spam" aria-label="Mark as spam"
+                    onClick={() => moveMessage(m, "spam")}
+                  >
+                    <AlertOctagonIcon size={15} />
+                  </span>
+                  <span
+                    role="button" tabIndex={0} className="row-act danger" title="Delete" aria-label="Delete"
+                    onClick={() => moveMessage(m, "trash")}
+                  >
+                    <Trash2 size={15} />
+                  </span>
+                </div>
               </button>
             ))
           )}
@@ -1869,7 +2114,14 @@ export default function Beacon() {
       {/* ---------- reading pane ---------- */}
       <section className="reader">
         {selected ? (
-          <Reader m={selected} account={activeAccount} onStar={(e) => toggleStar(e, selected)} />
+          <Reader
+            m={selected}
+            account={activeAccount}
+            onStar={(e) => toggleStar(e, selected)}
+            onSendReply={sendEmailReply}
+            onMove={(dest) => moveMessage(selected, dest)}
+            onMarkUnread={() => markMessageRead(selected, false)}
+          />
         ) : (
           <div className="reader-empty">
             <Mail size={48} strokeWidth={1.1} />
@@ -2355,7 +2607,8 @@ function AuthScreen({ onDone }) {
 }
 
 /* ---- Profile: personal info + connected account management ---- */
-function ProfileScreen({ profile, onSaveProfile, onChangePassword, accounts, workspaces, teamsOrgs, onDisconnect, onLogout, onBack, live }) {
+function ProfileScreen({ profile, onSaveProfile, onChangePassword, accounts, workspaces, teamsOrgs, onDisconnect, onSetLabel, onLogout, onBack, live }) {
+  const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({
     firstName: profile?.firstName || "",
     lastName: profile?.lastName || "",
@@ -2446,7 +2699,20 @@ function ProfileScreen({ profile, onSaveProfile, onChangePassword, accounts, wor
                   </span>
                 </span>
                 <span className="prof-acc-text">
-                  <span className="qa-label">{c.label || c.prov.name}</span>
+                  {editingId === c.id ? (
+                    <LabelEditor
+                      initial={c.label}
+                      onSave={(v) => { onSetLabel(c.id, v); setEditingId(null); }}
+                      onCancel={() => setEditingId(null)}
+                    />
+                  ) : (
+                    <span className="qa-label prof-label-row">
+                      {c.label || c.prov.name}
+                      <button className="prof-label-edit" onClick={() => setEditingId(c.id)} title="Edit label" aria-label="Edit label">
+                        <Pencil size={12} />
+                      </button>
+                    </span>
+                  )}
                   <span className="qa-sub">{c.address} · {c.group}</span>
                 </span>
                 <button className="prof-disconnect" onClick={() => onDisconnect(c.id)}>Disconnect</button>
@@ -3131,19 +3397,220 @@ function SlackComposer({ placeholder, onSend }) {
   );
 }
 
-function Reader({ m, account, onStar }) {
+/* ---- Email reply composer: WYSIWYG via contentEditable + execCommand ---- */
+function ReplyComposer({ mode, m, account, onSend, onClose }) {
+  const initialTo = useMemo(() => {
+    if (mode === "forward") return "";
+    const set = new Set([m.fromAddr]);
+    if (mode === "replyAll") {
+      for (const addr of [...(m.to || []), ...(m.cc || [])]) set.add(addr);
+    }
+    set.delete(account?.address); // don't reply to yourself
+    return [...set].filter(Boolean).join(", ");
+  }, [mode, m, account]);
+
+  const [to, setTo] = useState(initialTo);
+  const [subject, setSubject] = useState(
+    (mode === "forward" ? "Fwd: " : "Re: ") + (m.subject || "").replace(/^(Re|Fwd):\s*/i, "")
+  );
+  const editorRef = useRef(null);
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Dropdowns and popovers steal focus, which collapses the text selection —
+  // so we snapshot the range before they open and restore it before applying.
+  const savedRange = useRef(null);
+  const [colorOpen, setColorOpen] = useState(false);
+  const saveSel = () => {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount) savedRange.current = sel.getRangeAt(0).cloneRange();
+  };
+  const restoreSel = () => {
+    const r = savedRange.current;
+    if (!r) return;
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  };
+  const exec = (cmd, val = null) => {
+    editorRef.current?.focus();
+    document.execCommand(cmd, false, val);
+  };
+  const execPreserving = (cmd, val = null) => {
+    restoreSel();
+    exec(cmd, val);
+  };
+
+  const send = async () => {
+    const html = editorRef.current?.innerHTML || "";
+    const text = editorRef.current?.innerText || "";
+    if (!to.trim() || !text.trim()) return;
+    setSending(true);
+    setError(null);
+    try {
+      await onSend({ to: to.trim(), subject, html, text });
+      setSent(true);
+      setTimeout(onClose, 900);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const FONTS = [
+    ["Sans Serif", "Arial, sans-serif"],
+    ["Serif", "Georgia, serif"],
+    ["Fixed width", "monospace"],
+  ];
+  const SIZES = [["Small", "1"], ["Normal", "3"], ["Large", "5"], ["Huge", "7"]];
+  const COLORS = [
+    "#1a1d21", "#5b6470", "#B91C1C", "#C2410C", "#B45309",
+    "#15803D", "#0E7490", "#1D4ED8", "#7C3AED", "#DB2777",
+  ];
+  const btn = (cmd, node, title, val = null) => (
+    <button
+      key={title}
+      className="rc-tool"
+      title={title}
+      aria-label={title}
+      onMouseDown={(e) => { e.preventDefault(); exec(cmd, val); }}
+    >
+      {node}
+    </button>
+  );
+
+  return (
+    <div className="rc">
+      <div className="rc-head">
+        <strong>{mode === "forward" ? "Forward" : mode === "replyAll" ? "Reply all" : "Reply"}</strong>
+        <button className="rc-close" onClick={onClose} aria-label="Discard"><X size={15} /></button>
+      </div>
+      <div className="rc-field">
+        <label>To</label>
+        <input value={to} onChange={(e) => setTo(e.target.value)} placeholder="Recipients (comma separated)" />
+      </div>
+      <div className="rc-field">
+        <label>Subject</label>
+        <input value={subject} onChange={(e) => setSubject(e.target.value)} />
+      </div>
+      <div className="rc-toolbar">
+        <select
+          className="rc-select"
+          title="Font"
+          aria-label="Font"
+          onMouseDown={saveSel}
+          onChange={(e) => execPreserving("fontName", e.target.value)}
+        >
+          {FONTS.map(([name, val]) => <option key={val} value={val}>{name}</option>)}
+        </select>
+        <select
+          className="rc-select rc-select-size"
+          title="Text size"
+          aria-label="Text size"
+          defaultValue="3"
+          onMouseDown={saveSel}
+          onChange={(e) => execPreserving("fontSize", e.target.value)}
+        >
+          {SIZES.map(([name, val]) => <option key={val} value={val}>{name}</option>)}
+        </select>
+        <span className="rc-sep" />
+        {btn("bold", <strong>B</strong>, "Bold")}
+        {btn("italic", <em>I</em>, "Italic")}
+        {btn("underline", <u>U</u>, "Underline")}
+        {btn("strikeThrough", <s>S</s>, "Strikethrough")}
+        <span className="rc-color-wrap">
+          <button
+            className="rc-tool rc-color-btn"
+            title="Text color"
+            aria-label="Text color"
+            onMouseDown={(e) => { e.preventDefault(); saveSel(); setColorOpen((v) => !v); }}
+          >
+            A<span className="rc-color-bar" />
+          </button>
+          {colorOpen && (
+            <>
+              <div className="sl-emoji-backdrop" onMouseDown={() => setColorOpen(false)} />
+              <div className="rc-color-pop" role="menu">
+                {COLORS.map((c) => (
+                  <button
+                    key={c}
+                    className="rc-swatch"
+                    style={{ background: c }}
+                    aria-label={`Color ${c}`}
+                    onMouseDown={(e) => { e.preventDefault(); execPreserving("foreColor", c); setColorOpen(false); }}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </span>
+        <span className="rc-sep" />
+        {btn("justifyLeft", <AlignLeft size={15} />, "Align left")}
+        {btn("justifyCenter", <AlignCenter size={15} />, "Align center")}
+        {btn("justifyRight", <AlignRight size={15} />, "Align right")}
+        <span className="rc-sep" />
+        {btn("insertOrderedList", <ListOrdered size={15} />, "Numbered list")}
+        {btn("insertUnorderedList", <List size={15} />, "Bullet list")}
+        {btn("outdent", <IndentDecrease size={15} />, "Decrease indent")}
+        {btn("indent", <IndentIncrease size={15} />, "Increase indent")}
+        {btn("formatBlock", <Quote size={15} />, "Quote", "blockquote")}
+        <span className="rc-sep" />
+        {btn("removeFormat", <RemoveFormatting size={15} />, "Clear formatting")}
+      </div>
+      <div
+        ref={editorRef}
+        className="rc-editor"
+        contentEditable
+        suppressContentEditableWarning
+        role="textbox"
+        aria-multiline="true"
+        aria-label="Message body"
+      />
+      {error && <div className="auth-error rc-error">{error}</div>}
+      <div className="rc-foot">
+        <button className="reply-btn" onClick={send} disabled={sending || sent}>
+          <Send size={14} /> {sent ? "Sent ✓" : sending ? "Sending…" : "Send"}
+        </button>
+        <button className="reply-btn ghost" onClick={onClose}>Discard</button>
+      </div>
+    </div>
+  );
+}
+
+function Reader({ m, account, onStar, onSendReply, onMove, onMarkUnread }) {
+  const [replyMode, setReplyMode] = useState(null);
+  const [moreOpen, setMoreOpen] = useState(false);
   return (
     <>
       <div className="reader-bar">
         <div className="reader-actions">
-          <button title="Archive"><Archive size={17} /></button>
-          <button title="Delete"><Trash2 size={17} /></button>
-          <button title="Spam"><AlertOctagonIcon size={17} /></button>
+          <button title="Archive" aria-label="Archive" onClick={() => onMove("archive")}><Archive size={17} /></button>
+          <button title="Delete" aria-label="Delete" onClick={() => onMove("trash")}><Trash2 size={17} /></button>
+          <button title="Mark as spam" aria-label="Mark as spam" onClick={() => onMove("spam")}><AlertOctagonIcon size={17} /></button>
           <span className="bar-sep" />
-          <button className={m.starred ? "on" : ""} onClick={onStar} title="Star">
+          <button className={m.starred ? "on" : ""} onClick={onStar} title="Star" aria-label="Star">
             <Star size={17} fill={m.starred ? "currentColor" : "none"} />
           </button>
-          <button title="More"><MoreHorizontal size={17} /></button>
+          <span className="reader-more-wrap">
+            <button title="More" aria-label="More actions" onClick={() => setMoreOpen((v) => !v)}>
+              <MoreHorizontal size={17} />
+            </button>
+            {moreOpen && (
+              <>
+                <div className="sl-emoji-backdrop" onClick={() => setMoreOpen(false)} />
+                <div className="reader-more-menu" role="menu">
+                  <button onClick={() => { setMoreOpen(false); onMarkUnread(); }}>
+                    <MailOpen size={14} /> Mark as unread
+                  </button>
+                  <button onClick={() => { setMoreOpen(false); onMove("inbox"); }}>
+                    <Inbox size={14} /> Move to inbox
+                  </button>
+                </div>
+              </>
+            )}
+          </span>
         </div>
         <span className="reader-acct">{account?.label || account?.address}</span>
       </div>
@@ -3165,11 +3632,20 @@ function Reader({ m, account, onStar }) {
           </div>
         </div>
 
-        <div className="reader-body">
-          {(m.body || m.preview || "").split("\n").map((line, i) =>
-            line.trim() === "" ? <br key={i} /> : <p key={i}>{line}</p>
-          )}
-        </div>
+        {m.bodyHtml ? (
+          <iframe
+            className="reader-html"
+            title="Email content"
+            sandbox="allow-popups allow-popups-to-escape-sandbox"
+            srcDoc={emailHtmlDoc(m.bodyHtml)}
+          />
+        ) : (
+          <div className="reader-body">
+            {(m.body || m.preview || "").split("\n").map((line, i) =>
+              line.trim() === "" ? <br key={i} /> : <p key={i}>{line}</p>
+            )}
+          </div>
+        )}
 
         {m.attachments.length > 0 && (
           <div className="attachments">
@@ -3184,10 +3660,21 @@ function Reader({ m, account, onStar }) {
         )}
 
         <div className="reader-reply">
-          <button className="reply-btn"><Reply size={15} /> Reply</button>
-          <button className="reply-btn ghost"><ReplyAll size={15} /> Reply all</button>
-          <button className="reply-btn ghost"><Forward size={15} /> Forward</button>
+          <button className="reply-btn" onClick={() => setReplyMode("reply")}><Reply size={15} /> Reply</button>
+          <button className="reply-btn ghost" onClick={() => setReplyMode("replyAll")}><ReplyAll size={15} /> Reply all</button>
+          <button className="reply-btn ghost" onClick={() => setReplyMode("forward")}><Forward size={15} /> Forward</button>
         </div>
+
+        {replyMode && (
+          <ReplyComposer
+            key={replyMode + m.id}
+            mode={replyMode}
+            m={m}
+            account={account}
+            onSend={(payload) => onSendReply(m, payload)}
+            onClose={() => setReplyMode(null)}
+          />
+        )}
       </div>
     </>
   );
@@ -3394,7 +3881,7 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
   color:var(--ink); padding:0; border-radius:6px;
 }
 .acc-label span{max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
-.acc-label svg{opacity:0; transition:.15s; flex-shrink:0; color:var(--ink-3)}
+.acc-label svg{opacity:.5; transition:.15s; flex-shrink:0; color:var(--ink-3)}
 .acc-label:hover svg{opacity:1}
 .acc-addr{font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:170px}
 .label-edit{display:flex; gap:4px; align-items:center}
@@ -3481,6 +3968,36 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .row-star.on{color:var(--star)}
 .row-clip{color:var(--ink-3)}
 .row-unread-dot{color:var(--accent)}
+.row{position:relative}
+.row-actions{
+  position:absolute; right:10px; top:50%; transform:translateY(-50%);
+  display:none; gap:2px; background:var(--panel); border:1px solid var(--line);
+  border-radius:9px; padding:3px; box-shadow:var(--shadow);
+}
+.row:hover .row-actions{display:flex}
+.row-act{
+  width:27px; height:27px; border-radius:7px; display:grid; place-items:center;
+  color:var(--ink-2); cursor:pointer; transition:.1s;
+}
+.row-act:hover{background:var(--line-2); color:var(--ink)}
+.row-act.danger:hover{background:#FEF2F2; color:#B91C1C}
+
+.reader-more-wrap{position:relative; display:inline-flex}
+.reader-more-menu{
+  position:absolute; top:calc(100% + 6px); right:0; z-index:31; background:var(--panel);
+  border:1px solid var(--line); border-radius:11px; box-shadow:0 10px 30px rgba(16,24,40,.16);
+  padding:5px; display:flex; flex-direction:column; min-width:180px; animation:pop .14s;
+}
+.reader-more-menu button{
+  display:flex; align-items:center; gap:9px; padding:8px 11px; border-radius:8px;
+  font-size:13px; color:var(--ink); text-align:left; width:100%;
+}
+.reader-more-menu button:hover{background:var(--line-2)}
+
+.reader-html{
+  width:100%; min-height:420px; border:none; background:var(--panel);
+  border-radius:10px; margin:20px 0; display:block;
+}
 
 .empty,.reader-empty{
   display:flex; flex-direction:column; align-items:center; justify-content:center;
@@ -4042,6 +4559,59 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .tm-bubble-row.mine .tm-reactions{justify-content:flex-end}
 .tm-bubble-row.mine .sl-emoji-pop{left:auto; right:0}
 
+.rail-group-gap{height:8px; flex-shrink:0}
+
+/* email reply composer */
+.rc{
+  margin-top:20px; background:var(--panel); border:1px solid var(--line); border-radius:14px;
+  box-shadow:var(--shadow); overflow:hidden;
+}
+.rc-head{
+  display:flex; align-items:center; justify-content:space-between; padding:12px 16px;
+  border-bottom:1px solid var(--line-2); font-size:14px;
+}
+.rc-close{color:var(--ink-3); padding:4px; border-radius:6px; display:grid; place-items:center}
+.rc-close:hover{background:var(--line-2); color:var(--ink)}
+.rc-field{display:flex; align-items:center; gap:10px; padding:9px 16px; border-bottom:1px solid var(--line-2)}
+.rc-field label{font-size:12px; color:var(--ink-3); width:52px; flex-shrink:0}
+.rc-field input{flex:1; border:none; outline:none; font-size:13.5px; font-family:inherit; background:none}
+.rc-toolbar{display:flex; align-items:center; gap:2px; padding:7px 12px; border-bottom:1px solid var(--line-2); flex-wrap:wrap}
+.rc-select{
+  border:1px solid var(--line); border-radius:7px; padding:4px 6px; font-size:12px;
+  font-family:inherit; color:var(--ink-2); background:var(--panel); outline:none; cursor:pointer;
+  max-width:104px;
+}
+.rc-select:hover{border-color:var(--accent)}
+.rc-select-size{max-width:84px}
+.rc-sep{width:1px; height:18px; background:var(--line); margin:0 5px; flex-shrink:0}
+.rc-color-wrap{position:relative; display:inline-flex}
+.rc-color-btn{flex-direction:column; gap:0; line-height:1; font-weight:700; font-size:13px}
+.rc-color-btn{display:grid}
+.rc-color-bar{width:14px; height:3px; background:#B91C1C; border-radius:2px; margin-top:1px}
+.rc-color-pop{
+  position:absolute; top:calc(100% + 6px); left:0; z-index:31; background:var(--panel);
+  border:1px solid var(--line); border-radius:10px; box-shadow:0 10px 30px rgba(16,24,40,.16);
+  padding:8px; display:grid; grid-template-columns:repeat(5,1fr); gap:6px; animation:pop .14s;
+}
+.rc-swatch{width:22px; height:22px; border-radius:6px; border:1px solid rgba(0,0,0,.08); cursor:pointer}
+.rc-swatch:hover{transform:scale(1.12)}
+.rc-tool{
+  min-width:30px; height:28px; border-radius:7px; display:grid; place-items:center;
+  color:var(--ink-2); font-size:13px; transition:.1s; padding:0 7px;
+}
+.rc-tool:hover{background:var(--line-2); color:var(--ink)}
+.rc-editor{
+  min-height:140px; max-height:320px; overflow-y:auto; padding:14px 16px; font-size:14px;
+  line-height:1.6; outline:none;
+}
+.rc-editor:focus{background:#fdfdfe}
+.rc-editor ul,.rc-editor ol{padding-left:22px; margin:6px 0}
+.rc-editor blockquote{
+  border-left:3px solid var(--line); margin:8px 0; padding:2px 0 2px 12px; color:var(--ink-2);
+}
+.rc-error{margin:0 16px 10px}
+.rc-foot{display:flex; gap:10px; padding:12px 16px; border-top:1px solid var(--line-2)}
+
 /* apple connect form */
 .apple-form{display:flex; flex-direction:column; gap:10px}
 .apple-form-hint{margin:0; font-size:12.5px; color:var(--ink-2); line-height:1.55}
@@ -4131,6 +4701,11 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .prof-accounts{display:flex; flex-direction:column; gap:10px}
 .prof-acc{display:flex; align-items:center; gap:12px; padding:10px 12px; border:1px solid var(--line); border-radius:11px}
 .prof-acc-text{display:flex; flex-direction:column; min-width:0; flex:1; gap:1px}
+.prof-label-row{display:inline-flex; align-items:center; gap:6px}
+.prof-label-edit{
+  color:var(--ink-3); display:grid; place-items:center; padding:3px; border-radius:5px; opacity:.6;
+}
+.prof-label-edit:hover{background:var(--line-2); color:var(--ink); opacity:1}
 .prof-disconnect{
   font-size:12.5px; font-weight:650; color:#B91C1C; border:1px solid #FECACA; border-radius:8px;
   padding:7px 13px; background:#FEF2F2; transition:.13s; flex-shrink:0;

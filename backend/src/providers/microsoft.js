@@ -167,9 +167,12 @@ export const microsoftProvider = {
       id: m.id,
       from: m.from?.emailAddress?.name || "",
       fromAddr: m.from?.emailAddress?.address || "",
+      to: (m.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean),
+      cc: (m.ccRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean),
       subject: m.subject || "(no subject)",
       fullDate: new Date(m.receivedDateTime).toLocaleString(),
       body: m.body?.contentType === "html" ? stripHtml(m.body.content) : m.body?.content || "",
+      bodyHtml: m.body?.contentType === "html" ? m.body.content : null,
       unread: m.isRead === false,
       starred: m.flag?.flagStatus === "flagged",
       attachments,
@@ -180,6 +183,15 @@ export const microsoftProvider = {
     await graph(account, `/me/messages/${id}`, { method: "PATCH", body: { isRead: read } });
   },
 
+  // Move via Graph; note Graph assigns the moved message a NEW id, so the
+  // client should drop its local copy rather than track it.
+  async move(account, id, dest) {
+    await graph(account, `/me/messages/${id}/move`, {
+      method: "POST",
+      body: { destinationId: FOLDER_MAP[dest] || "inbox" },
+    });
+  },
+
   async toggleStar(account, id, starred) {
     await graph(account, `/me/messages/${id}`, {
       method: "PATCH",
@@ -187,14 +199,14 @@ export const microsoftProvider = {
     });
   },
 
-  async send(account, { to, subject, body }) {
+  async send(account, { to, subject, body, html }) {
     await graph(account, "/me/sendMail", {
       method: "POST",
       body: {
         message: {
           subject,
-          body: { contentType: "Text", content: body },
-          toRecipients: [{ emailAddress: { address: to } }],
+          body: { contentType: html ? "HTML" : "Text", content: html || body },
+          toRecipients: to.split(",").map((a) => ({ emailAddress: { address: a.trim() } })),
         },
       },
     });

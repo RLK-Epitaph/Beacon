@@ -139,6 +139,37 @@ export const slackProvider = {
     return out;
   },
 
+  // Per-conversation unread counts for the notification poller. Slack only
+  // exposes unread_count_display via conversations.info (one call per channel),
+  // so we cap the fan-out and only check channels the user is actually in.
+  // Returns { total, byChannel: { channelId: count }, dmUnread }.
+  async listUnreadCounts(account) {
+    const token = account.secrets.user_token;
+    const { channels } = await slackApi(token, "users.conversations", {
+      types: "public_channel,private_channel,im,mpim",
+      exclude_archived: "true",
+      limit: "200",
+    });
+    let total = 0;
+    let dmUnread = 0;
+    const byChannel = {};
+    // Cap at 50 conversations per tick to stay well under rate limits.
+    for (const c of channels.slice(0, 50)) {
+      try {
+        const { channel } = await slackApi(token, "conversations.info", { channel: c.id });
+        const n = channel?.unread_count_display || 0;
+        if (n > 0) {
+          byChannel[c.id] = n;
+          total += n;
+          if (c.is_im || c.is_mpim) dmUnread += n;
+        }
+      } catch {
+        // Skip channels that error (e.g. not_in_channel) — they contribute 0.
+      }
+    }
+    return { total, byChannel, dmUnread };
+  },
+
   async listMessages(account, channelId, { limit = 30 } = {}) {
     const token = account.secrets.user_token;
     const selfId = account.secrets.user_id;

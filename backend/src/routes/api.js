@@ -214,8 +214,9 @@ apiRouter.patch("/accounts/:accountId/messages/:id", async (req, res) => {
   const acc = loadAccount(req, res);
   if (!acc) return;
   const provider = getProvider(acc.provider);
-  const { read, starred, folder } = req.body;
+  const { read, starred, folder, move } = req.body;
   try {
+    if (move) await provider.move(acc, req.params.id, move, folder);
     if (typeof read === "boolean") await provider.markRead(acc, req.params.id, read, folder);
     if (typeof starred === "boolean") await provider.toggleStar(acc, req.params.id, starred, folder);
     res.json({ ok: true });
@@ -228,10 +229,10 @@ apiRouter.patch("/accounts/:accountId/messages/:id", async (req, res) => {
 apiRouter.post("/accounts/:accountId/send", async (req, res) => {
   const acc = loadAccount(req, res);
   if (!acc) return;
-  const { to, subject, body } = req.body || {};
+  const { to, subject, body, html } = req.body || {};
   if (!to) return res.status(400).json({ error: "to is required" });
   try {
-    await getProvider(acc.provider).send(acc, { to, subject: subject || "", body: body || "" });
+    await getProvider(acc.provider).send(acc, { to, subject: subject || "", body: body || "", html });
     res.json({ sent: true });
   } catch (e) {
     res.status(502).json({ error: e.message });
