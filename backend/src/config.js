@@ -42,6 +42,20 @@ export const config = {
     ],
   },
 
+  slack: {
+    clientId: process.env.SLACK_CLIENT_ID || "",
+    clientSecret: process.env.SLACK_CLIENT_SECRET || "",
+    // User-token scopes — Beacon acts as the signed-in person, not a bot.
+    userScopes: [
+      "channels:read", "channels:history",
+      "groups:read", "groups:history",
+      "im:read", "im:history",
+      "mpim:read", "mpim:history",
+      "chat:write", "reactions:read", "reactions:write",
+      "users:read",
+    ],
+  },
+
   apple: {
     imapHost: process.env.IMAP_HOST || "imap.mail.me.com",
     imapPort: Number(process.env.IMAP_PORT || 993),
@@ -54,5 +68,6 @@ export function providerConfigured(provider) {
   if (provider === "google") return !!(config.google.clientId && config.google.clientSecret);
   if (provider === "microsoft") return !!(config.microsoft.clientId && config.microsoft.clientSecret);
   if (provider === "apple") return true; // per-account credentials, always "available"
+  if (provider === "slack") return !!(config.slack.clientId && config.slack.clientSecret);
   return false;
 }

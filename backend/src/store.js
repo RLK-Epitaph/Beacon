@@ -51,21 +51,30 @@ function decrypt(b64) {
 }
 
 let accounts = [];
+let users = {}; // userId → { firstName, lastName, email, createdAt }
 
 function load() {
   try {
     if (fs.existsSync(DB_PATH)) {
-      accounts = JSON.parse(decrypt(fs.readFileSync(DB_PATH, "utf8")));
+      const data = JSON.parse(decrypt(fs.readFileSync(DB_PATH, "utf8")));
+      // Backward compat: older files stored a bare accounts array.
+      if (Array.isArray(data)) {
+        accounts = data;
+      } else {
+        accounts = data.accounts || [];
+        users = data.users || {};
+      }
     }
   } catch (e) {
-    console.error("[store] failed to load accounts:", e.message);
+    console.error("[store] failed to load store:", e.message);
     accounts = [];
+    users = {};
   }
 }
 
 function save() {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  fs.writeFileSync(DB_PATH, encrypt(JSON.stringify(accounts)));
+  fs.writeFileSync(DB_PATH, encrypt(JSON.stringify({ accounts, users })));
 }
 
 load();
@@ -76,6 +85,48 @@ function publicView(a) {
 }
 
 export const store = {
+  /* ---- user profiles ----
+     Profiles are keyed by the session-derived userId. This gives a durable
+     identity per browser (14-day cookie). Upgrade path for cross-device
+     login: add a credential (password hash or magic-link email) and look up
+     the userId by email at sign-in instead of minting one per session. */
+  // Public view — NEVER include the password hash or salt.
+  getUser(userId) {
+    const u = users[userId];
+    if (!u) return null;
+    return { firstName: u.firstName, lastName: u.lastName, email: u.email, createdAt: u.createdAt };
+  },
+
+  // Full record (hash + salt) for credential checks only.
+  getUserAuth(userId) {
+    return users[userId] || null;
+  },
+
+  findUserByEmail(email) {
+    const norm = (email || "").trim().toLowerCase();
+    for (const [id, u] of Object.entries(users)) {
+      if (u.email === norm) return { id, ...u };
+    }
+    return null;
+  },
+
+  createUser(userId, { firstName, lastName, email, passwordHash, salt }) {
+    users[userId] = {
+      firstName, lastName, email, passwordHash, salt,
+      createdAt: new Date().toISOString(),
+    };
+    save();
+    return this.getUser(userId);
+  },
+
+  updateUser(userId, fields) {
+    const u = users[userId];
+    if (!u) return null;
+    users[userId] = { ...u, ...fields };
+    save();
+    return this.getUser(userId);
+  },
+
   listForUser(userId) {
     return accounts.filter((a) => a.userId === userId).map(publicView);
   },

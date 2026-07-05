@@ -599,6 +599,114 @@ const slackService = {
   async toggleReaction() { return true; },
 };
 
+/* ----- live slack service (talks to the Beacon backend) ------------------- */
+// Enabled when the frontend runs with VITE_BACKEND_URL set (frontend/.env.local).
+// Without it, Beacon runs entirely on the mock data above.
+const BACKEND = import.meta.env?.VITE_BACKEND_URL || null;
+
+async function backendApi(path, options = {}) {
+  const res = await fetch(`${BACKEND}${path}`, {
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+const liveSlackService = {
+  // Slack accounts come from the shared /api/accounts store; each is hydrated
+  // with its conversation list. Messages load lazily per channel (null = not
+  // loaded yet), unlike the mock which ships everything upfront.
+  async listWorkspaces() {
+    const { accounts } = await backendApi("/api/accounts");
+    const slackAccounts = accounts.filter((a) => a.provider === "slack");
+    return Promise.all(
+      slackAccounts.map(async (a) => {
+        let channels = [];
+        try {
+          const r = await backendApi(`/api/slack/${a.id}/conversations`);
+          channels = r.conversations.map((c) => ({ ...c, messages: null }));
+        } catch (e) {
+          console.warn("Slack conversations failed:", e.message);
+        }
+        return {
+          id: a.id, kind: "slack", provider: "slack",
+          workspace: a.address, label: a.label || a.address, address: a.address,
+          accent: "#4A154B", you: "You", channels,
+        };
+      })
+    );
+  },
+  // Full-page OAuth redirect; the backend bounces back with ?connect=ok.
+  connect() {
+    window.location.href = `${BACKEND}/auth/slack`;
+    return new Promise(() => {});
+  },
+  async listMessages(accountId, channelId) {
+    const { messages } = await backendApi(
+      `/api/slack/${accountId}/conversations/${channelId}/messages`
+    );
+    return messages.map((m) => ({ ...m, reactions: m.reactions || [], replies: [] }));
+  },
+  async listReplies(accountId, channelId, ts) {
+    const { messages } = await backendApi(
+      `/api/slack/${accountId}/conversations/${channelId}/thread/${ts}`
+    );
+    return messages.map((m) => ({ ...m, reactions: m.reactions || [], replies: [] }));
+  },
+  async postMessage(accountId, channelId, text, threadTs = null) {
+    await backendApi(`/api/slack/${accountId}/conversations/${channelId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text, ...(threadTs ? { thread_ts: threadTs } : {}) }),
+    });
+  },
+  async toggleReaction(accountId, channelId, timestamp, emoji, add) {
+    await backendApi(`/api/slack/${accountId}/conversations/${channelId}/reactions`, {
+      method: "POST",
+      body: JSON.stringify({ timestamp, emoji, add }),
+    });
+  },
+};
+
+const profileService = {
+  // Live mode: session-backed auth on the backend. Mock mode: a built-in
+  // demo identity so the app works without a backend.
+  async get() {
+    if (!BACKEND) return { firstName: "Alex", lastName: "Rivera", email: "alex.rivera@gmail.com" };
+    const { user } = await backendApi("/api/me");
+    return user;
+  },
+  async signup(fields) {
+    const { user } = await backendApi("/api/auth/signup", { method: "POST", body: JSON.stringify(fields) });
+    return user;
+  },
+  async login(email, password) {
+    const { user } = await backendApi("/api/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
+    return user;
+  },
+  async logout() {
+    await backendApi("/api/auth/logout", { method: "POST" });
+  },
+  async update(fields) {
+    if (!BACKEND) return fields;
+    const { user } = await backendApi("/api/me", { method: "PATCH", body: JSON.stringify(fields) });
+    return user;
+  },
+  async changePassword(currentPassword, newPassword) {
+    await backendApi("/api/me/password", { method: "PATCH", body: JSON.stringify({ currentPassword, newPassword }) });
+  },
+  async disconnectAccount(accountId) {
+    if (!BACKEND) return;
+    await backendApi(`/api/accounts/${accountId}`, { method: "DELETE" }).catch(() => {});
+  },
+};
+
+const slackAPI = BACKEND ? liveSlackService : slackService;
+
 /* ----- teams service (swap for Microsoft Graph later) --------------------- */
 
 const teamsService = {
@@ -688,6 +796,10 @@ export default function Beacon() {
   // Slack-specific UI state
   const [activeChannelId, setActiveChannelId] = useState(null);
   const [openThreadId, setOpenThreadId] = useState(null);
+  // User profile: null until loaded; live mode may require onboarding.
+  const [profile, setProfile] = useState(null);
+  const [profileLoaded, setProfileLoaded] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
   // Teams-specific UI state: either a (team, channel) pair or a chat is active.
   const [teamsOrgs, setTeamsOrgs] = useState([]);
   const [teamsSel, setTeamsSel] = useState({ teamId: null, channelId: null, chatId: null });
@@ -695,7 +807,7 @@ export default function Beacon() {
   useEffect(() => {
     Promise.all([
       mailService.listAccounts(),
-      slackService.listWorkspaces(),
+      slackAPI.listWorkspaces().catch((e) => { console.warn("Slack unavailable:", e.message); return []; }),
       teamsService.listAccounts(),
     ]).then(async ([accs, wss, tms]) => {
       setAccounts(accs);
@@ -707,6 +819,24 @@ export default function Beacon() {
       // Start on the home screen (activeAccountId stays null).
       setLoading(false);
     });
+    profileService
+      .get()
+      .then(setProfile)
+      .catch((e) => console.warn("Profile load failed:", e.message))
+      .finally(() => setProfileLoaded(true));
+  }, []);
+
+  // Handle the OAuth bounce-back (?connect=ok&account=...) from the backend.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.get("connect")) return;
+    const status = params.get("connect");
+    window.history.replaceState({}, "", window.location.pathname);
+    if (status === "ok" && BACKEND) {
+      liveSlackService.listWorkspaces().then(setWorkspaces).catch(() => {});
+    } else if (status === "error") {
+      console.warn("Account connect failed:", params.get("reason"));
+    }
   }, []);
 
   // No active account/workspace → show the home dashboard.
@@ -818,10 +948,11 @@ export default function Beacon() {
 
   const openThread = useMemo(() => {
     if (!activeChannel || !openThreadId) return null;
-    return activeChannel.messages.find((m) => m.id === openThreadId) || null;
+    return (activeChannel.messages || []).find((m) => m.id === openThreadId) || null;
   }, [activeChannel, openThreadId]);
 
   function goHome() {
+    setShowProfile(false);
     setActiveAccountId(null);
     setSelectedId(null);
     setQuery("");
@@ -850,9 +981,28 @@ export default function Beacon() {
     }
   }
 
-  function openChannel(channelId) {
+  async function openChannel(channelId) {
     setActiveChannelId(channelId);
     setOpenThreadId(null);
+    // Live mode: fetch this channel's history the first time it's opened.
+    if (BACKEND) {
+      const ws = workspaces.find((w) => w.id === activeAccountId);
+      const ch = ws?.channels.find((c) => c.id === channelId);
+      if (ch && ch.messages == null) {
+        try {
+          const messages = await liveSlackService.listMessages(activeAccountId, channelId);
+          setWorkspaces((prev) =>
+            prev.map((w) =>
+              w.id === activeAccountId
+                ? { ...w, channels: w.channels.map((c) => (c.id === channelId ? { ...c, messages } : c)) }
+                : w
+            )
+          );
+        } catch (e) {
+          console.warn("Failed to load channel:", e.message);
+        }
+      }
+    }
     // Mark channel read locally.
     setWorkspaces((prev) =>
       prev.map((w) =>
@@ -863,9 +1013,37 @@ export default function Beacon() {
     );
   }
 
+  async function openSlackThread(messageId) {
+    // Live mode: pull the thread's replies before showing the pane.
+    if (BACKEND && activeChannel) {
+      try {
+        const thread = await liveSlackService.listReplies(activeAccountId, activeChannel.id, messageId);
+        const replies = thread.slice(1); // [0] is the parent
+        setWorkspaces((prev) =>
+          prev.map((w) =>
+            w.id === activeAccountId
+              ? {
+                  ...w,
+                  channels: w.channels.map((c) =>
+                    c.id === activeChannel.id
+                      ? { ...c, messages: (c.messages || []).map((m) => (m.id === messageId ? { ...m, replies } : m)) }
+                      : c
+                  ),
+                }
+              : w
+          )
+        );
+      } catch (e) {
+        console.warn("Failed to load thread:", e.message);
+      }
+    }
+    setOpenThreadId(messageId);
+  }
+
   function sendSlackMessage(text) {
     if (!text.trim() || !activeChannel) return;
-    slackService.postMessage(activeChannel.id, text);
+    if (BACKEND) liveSlackService.postMessage(activeAccountId, activeChannel.id, text).catch((e) => console.warn(e.message));
+    else slackService.postMessage(activeChannel.id, text);
     const newMsg = smsg(activeWorkspace.you, text, { time: "now" });
     setWorkspaces((prev) =>
       prev.map((w) =>
@@ -883,7 +1061,8 @@ export default function Beacon() {
 
   function sendSlackReply(parentId, text) {
     if (!text.trim() || !activeChannel) return;
-    slackService.postReply(activeChannel.id, parentId, text);
+    if (BACKEND) liveSlackService.postMessage(activeAccountId, activeChannel.id, text, parentId).catch((e) => console.warn(e.message));
+    else slackService.postReply(activeChannel.id, parentId, text);
     const reply = smsg(activeWorkspace.you, text, { time: "now" });
     setWorkspaces((prev) =>
       prev.map((w) =>
@@ -908,7 +1087,19 @@ export default function Beacon() {
 
   function toggleReaction(messageId, emoji) {
     if (!activeChannel) return;
-    slackService.toggleReaction(activeChannel.id, messageId, emoji);
+    if (BACKEND) {
+      // Determine whether this toggle adds or removes before mutating state.
+      const msgs = activeChannel.messages || [];
+      const target =
+        msgs.find((m) => m.id === messageId) ||
+        msgs.flatMap((m) => m.replies || []).find((r) => r.id === messageId);
+      const willAdd = !(target?.reactions || []).some((r) => r.emoji === emoji && r.mine);
+      liveSlackService
+        .toggleReaction(activeAccountId, activeChannel.id, messageId, emoji, willAdd)
+        .catch((e) => console.warn(e.message));
+    } else {
+      slackService.toggleReaction(activeChannel.id, messageId, emoji);
+    }
 
     // Apply the toggle to a single message's reactions array.
     const applyToReactions = (reactions = []) => {
@@ -1107,6 +1298,7 @@ export default function Beacon() {
   async function connect(provider) {
     setConnecting(provider);
     if (provider === "slack") {
+      if (BACKEND) { liveSlackService.connect(); return; } // full-page OAuth redirect
       const ws = await slackService.connect();
       setWorkspaces((prev) => [...prev, ws]);
       setActiveAccountId(ws.id);
@@ -1136,6 +1328,21 @@ export default function Beacon() {
     setShowConnect(false);
   }
 
+  function disconnectAccount(id) {
+    // Backend delete only matters for live-stored accounts (Slack OAuth for
+    // now); mock accounts just vanish locally. Errors are swallowed upstream.
+    profileService.disconnectAccount(id);
+    setAccounts((prev) => prev.filter((a) => a.id !== id));
+    setWorkspaces((prev) => prev.filter((w) => w.id !== id));
+    setTeamsOrgs((prev) => prev.filter((t) => t.id !== id));
+    if (activeAccountId === id) goHome();
+  }
+
+  async function logout() {
+    try { await profileService.logout(); } catch { /* session may be gone */ }
+    window.location.reload();
+  }
+
   function saveLabel(id, value) {
     setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, label: value } : a)));
     setWorkspaces((prev) => prev.map((w) => (w.id === id ? { ...w, label: value } : w)));
@@ -1146,6 +1353,12 @@ export default function Beacon() {
   return (
     <div className={`md-root ${railExpanded ? "rail-open" : ""}`}>
       <style>{CSS}</style>
+      {BACKEND && !profileLoaded && (
+        <div className="auth-overlay"><div className="auth-splash">Loading Beacon…</div></div>
+      )}
+      {BACKEND && profileLoaded && !profile && (
+        <AuthScreen onDone={setProfile} />
+      )}
 
       {/* ---------- account rail ---------- */}
       <aside className={`rail ${railExpanded ? "is-expanded" : ""}`}>
@@ -1290,9 +1503,17 @@ export default function Beacon() {
           </button>
         </div>
 
-        <button className={`rail-settings ${railExpanded ? "wide" : ""}`} title="Settings">
+        <button
+          className={`rail-settings ${railExpanded ? "wide" : ""}`}
+          title="Profile & settings"
+          onClick={() => {
+            setActiveAccountId(null);
+            setSelectedId(null);
+            setShowProfile(true);
+          }}
+        >
           <Settings size={18} />
-          {railExpanded && <span>Settings</span>}
+          {railExpanded && <span>Profile</span>}
         </button>
       </aside>
 
@@ -1410,7 +1631,20 @@ export default function Beacon() {
       </nav>
 
       {/* ---------- main panes ---------- */}
-      {isHome ? (
+      {showProfile ? (
+        <ProfileScreen
+          profile={profile}
+          onSaveProfile={async (fields) => setProfile(await profileService.update(fields))}
+          onChangePassword={(cur, next) => profileService.changePassword(cur, next)}
+          accounts={accounts}
+          workspaces={workspaces}
+          teamsOrgs={teamsOrgs}
+          onDisconnect={disconnectAccount}
+          onLogout={logout}
+          onBack={goHome}
+          live={!!BACKEND}
+        />
+      ) : isHome ? (
         <HomeScreen
           accounts={accounts}
           workspaces={workspaces}
@@ -1420,13 +1654,15 @@ export default function Beacon() {
           unreadByWorkspace={unreadByWorkspace}
           unreadByTeamsOrg={unreadByTeamsOrg}
           onSelect={selectItem}
+          onConnect={() => setShowConnect(true)}
+          profile={profile}
         />
       ) : isSlack ? (
         <SlackView
           workspace={activeWorkspace}
           channel={activeChannel}
           openThread={openThread}
-          onOpenThread={setOpenThreadId}
+          onOpenThread={openSlackThread}
           onCloseThread={() => setOpenThreadId(null)}
           onSend={sendSlackMessage}
           onReply={sendSlackReply}
@@ -1693,6 +1929,9 @@ function CalendarWidget({ events = [], accounts = [] }) {
         <span className="widget-sub">{monthName} {year}</span>
       </div>
 
+      {accounts.length === 0 && (
+        <span className="cal-empty">Connect an email account to see its calendar here.</span>
+      )}
       {contributing.length > 0 && (
         <div className="cal-legend">
           {contributing.map((a) => (
@@ -1739,15 +1978,18 @@ const LIST_STATUS = {
   todo: { label: "To do", icon: Square, cls: "todo" },
 };
 
-function SlackListsWidget() {
+function SlackListsWidget({ lists = [] }) {
   return (
     <div className="widget widget-lists">
       <div className="widget-head">
         <h3><ListTodo size={15} /> Slack Lists</h3>
-        <span className="widget-sub">{SLACK_LISTS.length} lists</span>
+        <span className="widget-sub">{lists.length === 1 ? "1 list" : `${lists.length} lists`}</span>
       </div>
+      {lists.length === 0 && (
+        <span className="cal-empty">Connect a Slack workspace to see your lists here.</span>
+      )}
       <div className="lists-scroll">
-        {SLACK_LISTS.map((list) => {
+        {lists.map((list) => {
           const done = list.items.filter((i) => i.status === "done").length;
           return (
             <div className="list-card" key={list.id}>
@@ -1782,7 +2024,7 @@ function SlackListsWidget() {
 }
 
 /* ---- Home screen ---- */
-function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAccount, unreadByWorkspace, unreadByTeamsOrg = {}, onSelect }) {
+function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAccount, unreadByWorkspace, unreadByTeamsOrg = {}, onSelect, onConnect, profile }) {
   const now = new Date();
   const hour = now.getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
@@ -1795,7 +2037,7 @@ function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAcco
     <section className="home">
       <div className="home-scroll">
         <header className="home-header">
-          <h1>{greeting}, Alex</h1>
+          <h1>{greeting}{profile?.firstName ? `, ${profile.firstName}` : ""}</h1>
           <p className="home-summary">
             You have <strong>{totalEmailUnread}</strong> unread {totalEmailUnread === 1 ? "email" : "emails"},{" "}
             <strong>{totalSlackUnread}</strong> unread Slack {totalSlackUnread === 1 ? "message" : "messages"}, and{" "}
@@ -1814,6 +2056,15 @@ function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAcco
           <div className="widget-head">
             <h3><Mail size={15} /> Quick access</h3>
           </div>
+          {accounts.length + workspaces.length + teamsOrgs.length === 0 ? (
+            <div className="qa-cta">
+              <span className="qa-cta-title">Connect your first account</span>
+              <span className="qa-cta-sub">Email, Slack, and Teams accounts appear here once connected.</span>
+              <button className="qa-cta-btn" onClick={onConnect}>
+                <Plus size={15} /> Connect account
+              </button>
+            </div>
+          ) : (
           <div className="qa-grid">
             {accounts.map((a) => {
               const p = PROVIDERS[a.provider];
@@ -1867,14 +2118,193 @@ function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAcco
                 </button>
               );
             })}
+            <button className="qa-add" onClick={onConnect} title="Connect another account">
+              <Plus size={16} /> <span>Connect account</span>
+            </button>
           </div>
+          )}
         </div>
 
         {/* main row: calendar + slack lists */}
         <div className="home-row home-row-main">
           <CalendarWidget events={events} accounts={accounts} />
-          <SlackListsWidget />
+          <SlackListsWidget lists={BACKEND ? [] : SLACK_LISTS} />
         </div>
+      </div>
+    </section>
+  );
+}
+
+/* ---- Auth: signup / login (live mode only) ---- */
+function AuthScreen({ onDone }) {
+  const [mode, setMode] = useState("signup");
+  const [form, setForm] = useState({ firstName: "", lastName: "", email: "", password: "" });
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  const submit = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const user =
+        mode === "signup"
+          ? await profileService.signup(form)
+          : await profileService.login(form.email, form.password);
+      onDone(user);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="auth-overlay">
+      <div className="auth-card">
+        <div className="auth-brand"><Mail size={22} strokeWidth={2.4} /></div>
+        <h1>{mode === "signup" ? "Create your Beacon account" : "Welcome back"}</h1>
+        <p className="auth-sub">
+          {mode === "signup"
+            ? "One profile for all your email, Slack, and Teams accounts."
+            : "Log in to get back to your connected accounts."}
+        </p>
+
+        {mode === "signup" && (
+          <div className="auth-row">
+            <input placeholder="First name" value={form.firstName} onChange={set("firstName")} autoFocus />
+            <input placeholder="Last name" value={form.lastName} onChange={set("lastName")} />
+          </div>
+        )}
+        <input type="email" placeholder="Email" value={form.email} onChange={set("email")} autoFocus={mode === "login"} />
+        <input
+          type="password"
+          placeholder={mode === "signup" ? "Password (8+ characters)" : "Password"}
+          value={form.password}
+          onChange={set("password")}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+        />
+
+        {error && <div className="auth-error">{error}</div>}
+
+        <button className="auth-submit" onClick={submit} disabled={busy}>
+          {busy ? "One moment…" : mode === "signup" ? "Create account" : "Log in"}
+        </button>
+
+        <button className="auth-switch" onClick={() => { setMode(mode === "signup" ? "login" : "signup"); setError(null); }}>
+          {mode === "signup" ? "Already have an account? Log in" : "New here? Create an account"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ---- Profile: personal info + connected account management ---- */
+function ProfileScreen({ profile, onSaveProfile, onChangePassword, accounts, workspaces, teamsOrgs, onDisconnect, onLogout, onBack, live }) {
+  const [form, setForm] = useState({
+    firstName: profile?.firstName || "",
+    lastName: profile?.lastName || "",
+    email: profile?.email || "",
+  });
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState(null);
+  const [pw, setPw] = useState({ current: "", next: "" });
+  const [pwMsg, setPwMsg] = useState(null);
+
+  const set = (k) => (e) => { setForm((f) => ({ ...f, [k]: e.target.value })); setSaved(false); };
+
+  const save = async () => {
+    setErr(null);
+    try {
+      await onSaveProfile(form);
+      setSaved(true);
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+
+  const changePw = async () => {
+    setPwMsg(null);
+    try {
+      await onChangePassword(pw.current, pw.next);
+      setPw({ current: "", next: "" });
+      setPwMsg({ ok: true, text: "Password updated." });
+    } catch (e) {
+      setPwMsg({ ok: false, text: e.message });
+    }
+  };
+
+  const connected = [
+    ...accounts.map((a) => ({ ...a, group: "Email", prov: PROVIDERS[a.provider] })),
+    ...workspaces.map((w) => ({ ...w, group: "Slack", prov: PROVIDERS.slack })),
+    ...teamsOrgs.map((t) => ({ ...t, group: "Teams", prov: PROVIDERS.teams })),
+  ];
+
+  return (
+    <section className="home prof">
+      <div className="home-scroll">
+        <header className="home-header prof-header">
+          <h1>Profile & settings</h1>
+          <button className="prof-back" onClick={onBack}><Home size={15} /> Back to home</button>
+        </header>
+
+        <div className="widget prof-card">
+          <div className="widget-head"><h3><Settings size={15} /> Personal information</h3></div>
+          <div className="prof-grid">
+            <label>First name<input value={form.firstName} onChange={set("firstName")} /></label>
+            <label>Last name<input value={form.lastName} onChange={set("lastName")} /></label>
+            <label className="prof-wide">Email<input type="email" value={form.email} onChange={set("email")} /></label>
+          </div>
+          {err && <div className="auth-error">{err}</div>}
+          <div className="prof-actions">
+            <button className="auth-submit sm" onClick={save}>Save changes</button>
+            {saved && <span className="prof-saved">Saved ✓</span>}
+          </div>
+        </div>
+
+        {live && (
+          <div className="widget prof-card">
+            <div className="widget-head"><h3><Settings size={15} /> Change password</h3></div>
+            <div className="prof-grid">
+              <label>Current password<input type="password" value={pw.current} onChange={(e) => setPw((v) => ({ ...v, current: e.target.value }))} /></label>
+              <label>New password (8+ chars)<input type="password" value={pw.next} onChange={(e) => setPw((v) => ({ ...v, next: e.target.value }))} /></label>
+            </div>
+            {pwMsg && <div className={pwMsg.ok ? "prof-saved" : "auth-error"}>{pwMsg.text}</div>}
+            <div className="prof-actions">
+              <button className="auth-submit sm" onClick={changePw} disabled={!pw.current || !pw.next}>Update password</button>
+            </div>
+          </div>
+        )}
+
+        <div className="widget prof-card">
+          <div className="widget-head">
+            <h3><Mail size={15} /> Connected accounts</h3>
+            <span className="widget-sub">{connected.length} connected</span>
+          </div>
+          <div className="prof-accounts">
+            {connected.map((c) => (
+              <div className="prof-acc" key={c.id}>
+                <span className="qa-avatar" style={{ background: c.group === "Email" ? avatarColor(c.address) : c.accent || c.prov.gradient }}>
+                  {c.group === "Email" ? initials(c.address) : (c.workspace || c.org || "?").slice(0, 1)}
+                  <span className="qa-prov" style={{ background: c.prov.gradient }}>
+                    {c.prov.badge || <AppleGlyph size={9} />}
+                  </span>
+                </span>
+                <span className="prof-acc-text">
+                  <span className="qa-label">{c.label || c.prov.name}</span>
+                  <span className="qa-sub">{c.address} · {c.group}</span>
+                </span>
+                <button className="prof-disconnect" onClick={() => onDisconnect(c.id)}>Disconnect</button>
+              </div>
+            ))}
+            {connected.length === 0 && <span className="cal-empty">No accounts connected yet.</span>}
+          </div>
+        </div>
+
+        {live && (
+          <button className="prof-logout" onClick={onLogout}>Log out</button>
+        )}
       </div>
     </section>
   );
@@ -2359,7 +2789,10 @@ function SlackView({ workspace, channel, openThread, onOpenThread, onCloseThread
         </header>
 
         <div className="sl-stream">
-          {channel.messages.map((m) => (
+          {channel.messages == null ? (
+            <div className="empty">Loading messages…</div>
+          ) : (
+          channel.messages.map((m) => (
             <SlackMessage
               key={m.id}
               m={m}
@@ -2368,7 +2801,8 @@ function SlackView({ workspace, channel, openThread, onOpenThread, onCloseThread
               onOpenThread={() => onOpenThread(m.id)}
               onReact={onReact}
             />
-          ))}
+          ))
+          )}
         </div>
 
         <SlackComposer placeholder={`Message ${channel.kind === "channel" ? "#" + channel.name : channel.name}`}
@@ -2465,7 +2899,7 @@ function SlackMessage({ m, accent, onOpenThread, onReact, compact }) {
           </div>
         )}
 
-        {!compact && m.replies?.length > 0 && (
+        {!compact && ((m.replies?.length || 0) > 0 || (m.replyCount || 0) > 0) && (
           <button className="sl-thread-link" onClick={onOpenThread} style={{ color: accent }}>
             <span className="sl-thread-avatars">
               {m.replies.slice(0, 3).map((r, i) => (
@@ -2474,7 +2908,7 @@ function SlackMessage({ m, accent, onOpenThread, onReact, compact }) {
                 </span>
               ))}
             </span>
-            {m.replies.length} {m.replies.length === 1 ? "reply" : "replies"}
+            {m.replies?.length || m.replyCount} {(m.replies?.length || m.replyCount) === 1 ? "reply" : "replies"}
             <span className="sl-thread-last">View thread</span>
           </button>
         )}
@@ -3453,6 +3887,96 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .tm-bubble.mine{background:#E8EBFA; border-color:#D6DAF5}
 .tm-bubble-row.mine .tm-reactions{justify-content:flex-end}
 .tm-bubble-row.mine .sl-emoji-pop{left:auto; right:0}
+
+/* ===== home empty states ===== */
+.qa-cta{
+  display:flex; flex-direction:column; align-items:center; text-align:center;
+  padding:22px 16px; gap:5px;
+}
+.qa-cta-title{font-size:14.5px; font-weight:700; color:var(--ink)}
+.qa-cta-sub{font-size:12.5px; color:var(--ink-3); margin-bottom:10px}
+.qa-cta-btn{
+  display:inline-flex; align-items:center; gap:7px; background:var(--accent); color:#fff;
+  font-weight:650; font-size:13px; padding:10px 20px; border-radius:9px; transition:.15s;
+}
+.qa-cta-btn:hover{background:#324bc0}
+.qa-add{
+  display:flex; align-items:center; justify-content:center; gap:8px; padding:10px 12px;
+  border-radius:11px; border:1.5px dashed var(--line); color:var(--ink-3); font-size:13px;
+  font-weight:600; transition:.13s; background:none;
+}
+.qa-add:hover{border-color:var(--accent); color:var(--accent); background:var(--accent-soft)}
+
+/* ===== auth + profile ===== */
+.auth-overlay{
+  position:fixed; inset:0; z-index:100; background:var(--bg);
+  display:grid; place-items:center;
+}
+.auth-splash{font-size:15px; color:var(--ink-2); font-weight:600}
+.auth-card{
+  width:400px; max-width:92vw; background:var(--panel); border:1px solid var(--line);
+  border-radius:18px; padding:34px 32px; box-shadow:0 12px 40px rgba(16,24,40,.1);
+  display:flex; flex-direction:column; gap:11px;
+}
+.auth-brand{
+  width:44px; height:44px; border-radius:13px; display:grid; place-items:center;
+  background:linear-gradient(135deg,#4f6ef7,#3b5bdb); color:#fff; margin-bottom:4px;
+}
+.auth-card h1{margin:0; font-size:21px; font-weight:750; letter-spacing:-.015em}
+.auth-sub{margin:0 0 8px; font-size:13.5px; color:var(--ink-2); line-height:1.5}
+.auth-card input{
+  border:1px solid var(--line); border-radius:10px; padding:11px 13px; font-size:14px;
+  font-family:inherit; outline:none; width:100%;
+}
+.auth-card input:focus{border-color:var(--accent)}
+.auth-row{display:flex; gap:10px}
+.auth-error{
+  background:#FEF2F2; border:1px solid #FECACA; color:#B91C1C; border-radius:9px;
+  padding:9px 12px; font-size:13px;
+}
+.auth-submit{
+  background:var(--accent); color:#fff; font-weight:650; font-size:14px; padding:12px;
+  border-radius:10px; transition:.15s; margin-top:4px;
+}
+.auth-submit:hover:not(:disabled){background:#324bc0}
+.auth-submit:disabled{opacity:.6; cursor:default}
+.auth-submit.sm{padding:9px 18px; font-size:13px; margin-top:0; width:auto}
+.auth-switch{color:var(--accent); font-size:13px; font-weight:600; padding:4px}
+.auth-switch:hover{text-decoration:underline}
+
+.prof-header{display:flex; align-items:center; justify-content:space-between}
+.prof-back{
+  display:inline-flex; align-items:center; gap:7px; font-size:13px; font-weight:600;
+  color:var(--ink-2); border:1px solid var(--line); border-radius:9px; padding:8px 14px;
+  background:var(--panel); transition:.13s;
+}
+.prof-back:hover{border-color:var(--accent); color:var(--accent)}
+.prof-card{margin-bottom:18px}
+.prof-grid{display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:14px}
+.prof-grid label{
+  display:flex; flex-direction:column; gap:6px; font-size:12px; font-weight:650; color:var(--ink-2);
+}
+.prof-grid input{
+  border:1px solid var(--line); border-radius:9px; padding:10px 12px; font-size:14px;
+  font-family:inherit; outline:none;
+}
+.prof-grid input:focus{border-color:var(--accent)}
+.prof-wide{grid-column:1 / -1}
+.prof-actions{display:flex; align-items:center; gap:12px}
+.prof-saved{color:#15803D; font-size:13px; font-weight:650}
+.prof-accounts{display:flex; flex-direction:column; gap:10px}
+.prof-acc{display:flex; align-items:center; gap:12px; padding:10px 12px; border:1px solid var(--line); border-radius:11px}
+.prof-acc-text{display:flex; flex-direction:column; min-width:0; flex:1; gap:1px}
+.prof-disconnect{
+  font-size:12.5px; font-weight:650; color:#B91C1C; border:1px solid #FECACA; border-radius:8px;
+  padding:7px 13px; background:#FEF2F2; transition:.13s; flex-shrink:0;
+}
+.prof-disconnect:hover{background:#FEE2E2}
+.prof-logout{
+  font-size:13.5px; font-weight:650; color:var(--ink-2); border:1px solid var(--line);
+  border-radius:10px; padding:10px 20px; background:var(--panel); transition:.13s;
+}
+.prof-logout:hover{border-color:#B91C1C; color:#B91C1C}
 
 /* ===== responsive: narrow viewports =====
    Lives at the END of the stylesheet so it wins the cascade over pane rules

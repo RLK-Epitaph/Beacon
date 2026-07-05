@@ -46,7 +46,10 @@ class SyncEngine extends EventEmitter {
   }
 
   // Poll a single account; emit a change event if its unread map shifted.
+  // Providers without listFolders (e.g. Slack) are skipped — their clients
+  // fetch conversation state directly.
   async pollAccount(acc) {
+    if (typeof getProvider(acc.provider).listFolders !== "function") return;
     if (this.inFlight.has(acc.id)) return;
     this.inFlight.add(acc.id);
     try {

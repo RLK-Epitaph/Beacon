@@ -18,6 +18,11 @@ app.use(
 );
 app.use(express.json());
 app.use(cookieParser());
+// Behind ngrok or any HTTPS origin, the frontend (localhost:5173) is a
+// DIFFERENT site from the backend, so the session cookie must be
+// SameSite=None + Secure or browsers will drop it on cross-site fetches —
+// which would make OAuth-connected accounts invisible to the app.
+const secureCookies = config.serverOrigin.startsWith("https");
 app.use(
   session({
     secret: config.sessionSecret,
@@ -25,8 +30,8 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      sameSite: "lax",
-      secure: config.serverOrigin.startsWith("https"),
+      sameSite: secureCookies ? "none" : "lax",
+      secure: secureCookies,
       maxAge: 1000 * 60 * 60 * 24 * 14, // 14 days
     },
   })
