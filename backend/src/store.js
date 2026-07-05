@@ -183,6 +183,13 @@ export const store = {
     return publicView(acc);
   },
 
+  // Dev/testing helper: wipe everything (users, accounts, tokens).
+  reset() {
+    accounts = [];
+    users = {};
+    save();
+  },
+
   remove(userId, accountId) {
     const before = accounts.length;
     accounts = accounts.filter((a) => !(a.userId === userId && a.id === accountId));

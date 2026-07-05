@@ -705,6 +705,48 @@ const profileService = {
   },
 };
 
+const liveMailService = {
+  // Mail accounts from the shared backend store (Google/Microsoft OAuth,
+  // Apple app-password). Messages load lazily per folder.
+  async listAccounts() {
+    const { accounts } = await backendApi("/api/accounts");
+    return accounts
+      .filter((a) => ["google", "microsoft", "apple"].includes(a.provider))
+      .map((a) => ({ ...a, kind: "email", messages: [], _loadedFolders: {} }));
+  },
+  async listFolderMessages(accountId, folder) {
+    const { messages } = await backendApi(`/api/accounts/${accountId}/folders/${folder}/messages?limit=30`);
+    return messages;
+  },
+  async getMessage(accountId, id, folder) {
+    const { message } = await backendApi(`/api/accounts/${accountId}/messages/${id}?folder=${folder}`);
+    return message;
+  },
+  connectRedirect(provider) {
+    window.location.href = `${BACKEND}/auth/${provider}`;
+    return new Promise(() => {});
+  },
+  async connectApple(address, appPassword) {
+    const { account } = await backendApi("/auth/apple/password", {
+      method: "POST",
+      body: JSON.stringify({ address, appPassword }),
+    });
+    return { ...account, kind: "email", messages: [], _loadedFolders: {} };
+  },
+  async markRead(accountId, id, read, folder) {
+    await backendApi(`/api/accounts/${accountId}/messages/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ read, folder }),
+    });
+  },
+  async toggleStar(accountId, id, starred, folder) {
+    await backendApi(`/api/accounts/${accountId}/messages/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ starred, folder }),
+    });
+  },
+};
+
 const slackAPI = BACKEND ? liveSlackService : slackService;
 
 /* ----- teams service (swap for Microsoft Graph later) --------------------- */
@@ -790,6 +832,7 @@ export default function Beacon() {
   const [query, setQuery] = useState("");
   const [connecting, setConnecting] = useState(null);
   const [showConnect, setShowConnect] = useState(false);
+  const [appleForm, setAppleForm] = useState(null);
   const [editingLabel, setEditingLabel] = useState(null);
   const [composing, setComposing] = useState(false);
   const [railExpanded, setRailExpanded] = useState(false);
@@ -806,9 +849,9 @@ export default function Beacon() {
 
   useEffect(() => {
     Promise.all([
-      mailService.listAccounts(),
+      BACKEND ? liveMailService.listAccounts().catch((e) => { console.warn("Mail unavailable:", e.message); return []; }) : mailService.listAccounts(),
       slackAPI.listWorkspaces().catch((e) => { console.warn("Slack unavailable:", e.message); return []; }),
-      teamsService.listAccounts(),
+      BACKEND ? Promise.resolve([]) : teamsService.listAccounts(),
     ]).then(async ([accs, wss, tms]) => {
       setAccounts(accs);
       setWorkspaces(wss);
@@ -834,6 +877,7 @@ export default function Beacon() {
     window.history.replaceState({}, "", window.location.pathname);
     if (status === "ok" && BACKEND) {
       liveSlackService.listWorkspaces().then(setWorkspaces).catch(() => {});
+      liveMailService.listAccounts().then(setAccounts).catch(() => {});
     } else if (status === "error") {
       console.warn("Account connect failed:", params.get("reason"));
     }
@@ -891,14 +935,14 @@ export default function Beacon() {
   const unreadByAccount = useMemo(() => {
     const map = {};
     for (const a of accounts) {
-      map[a.id] = a.messages.filter((m) => m.unread && m.folder === "inbox").length;
+      map[a.id] = (a.messages || []).filter((m) => m.unread && m.folder === "inbox").length;
     }
     return map;
   }, [accounts]);
 
   const folderMessages = useMemo(() => {
     if (!activeAccount) return [];
-    let list = activeAccount.messages.filter((m) =>
+    let list = (activeAccount.messages || []).filter((m) =>
       activeFolder === "starred" ? m.starred : m.folder === activeFolder
     );
     if (query.trim()) {
@@ -921,8 +965,8 @@ export default function Beacon() {
     for (const f of FOLDERS) {
       c[f.id] =
         f.id === "starred"
-          ? activeAccount.messages.filter((m) => m.starred).length
-          : activeAccount.messages.filter((m) => m.unread && m.folder === f.id).length;
+          ? (activeAccount.messages || []).filter((m) => m.starred).length
+          : (activeAccount.messages || []).filter((m) => m.unread && m.folder === f.id).length;
     }
     return c;
   }, [activeAccount]);
@@ -960,12 +1004,35 @@ export default function Beacon() {
     setComposing(false);
   }
 
+  async function loadMailFolder(accountId, folder) {
+    if (!BACKEND) return;
+    const acc = accounts.find((a) => a.id === accountId);
+    if (!acc || acc._loadedFolders?.[folder]) return;
+    try {
+      const fetched = await liveMailService.listFolderMessages(accountId, folder);
+      setAccounts((prev) =>
+        prev.map((a) => {
+          if (a.id !== accountId) return a;
+          const known = new Set((a.messages || []).map((m) => m.id));
+          return {
+            ...a,
+            messages: [...(a.messages || []), ...fetched.filter((m) => !known.has(m.id))],
+            _loadedFolders: { ...(a._loadedFolders || {}), [folder]: true },
+          };
+        })
+      );
+    } catch (e) {
+      console.warn("Failed to load folder:", e.message);
+    }
+  }
+
   function selectItem(id) {
     setActiveAccountId(id);
     setSelectedId(null);
     setQuery("");
     const ws = workspaces.find((w) => w.id === id);
     const org = teamsOrgs.find((t) => t.id === id);
+    if (!ws && !org) loadMailFolder(id, "inbox");
     if (ws) {
       setActiveChannelId(ws.channels[0]?.id ?? null);
       setOpenThreadId(null);
@@ -1271,8 +1338,24 @@ export default function Beacon() {
 
   function openMessage(m) {
     setSelectedId(m.id);
+    // Live mode: pull the full body if the list row only has a preview.
+    if (BACKEND && m.body === undefined) {
+      liveMailService
+        .getMessage(activeAccountId, m.id, m.folder || activeFolder)
+        .then((full) =>
+          setAccounts((prev) =>
+            prev.map((a) =>
+              a.id === activeAccountId
+                ? { ...a, messages: (a.messages || []).map((x) => (x.id === m.id ? { ...x, ...full, folder: x.folder } : x)) }
+                : a
+            )
+          )
+        )
+        .catch((e) => console.warn("Failed to load message:", e.message));
+    }
     if (m.unread) {
-      mailService.markRead(m.id);
+      if (BACKEND) liveMailService.markRead(activeAccountId, m.id, true, m.folder || activeFolder).catch(() => {});
+      else mailService.markRead(m.id);
       setAccounts((prev) =>
         prev.map((a) =>
           a.id === activeAccountId
@@ -1285,7 +1368,8 @@ export default function Beacon() {
 
   function toggleStar(e, m) {
     e.stopPropagation();
-    mailService.toggleStar(m.id, !m.starred);
+    if (BACKEND) liveMailService.toggleStar(activeAccountId, m.id, !m.starred, m.folder || activeFolder).catch(() => {});
+    else mailService.toggleStar(m.id, !m.starred);
     setAccounts((prev) =>
       prev.map((a) =>
         a.id === activeAccountId
@@ -1296,6 +1380,20 @@ export default function Beacon() {
   }
 
   async function connect(provider) {
+    if (BACKEND) {
+      // Live routing: OAuth redirects for Google/Microsoft/Slack; Apple uses
+      // the in-modal app-password form; Teams isn't wired to a backend yet.
+      if (provider === "google" || provider === "microsoft") {
+        setConnecting(provider);
+        liveMailService.connectRedirect(provider);
+        return;
+      }
+      if (provider === "apple") {
+        setAppleForm({ address: "", appPassword: "", error: null });
+        return;
+      }
+      if (provider === "teams") return; // button disabled in live mode
+    }
     setConnecting(provider);
     if (provider === "slack") {
       if (BACKEND) { liveSlackService.connect(); return; } // full-page OAuth redirect
@@ -1341,6 +1439,24 @@ export default function Beacon() {
   async function logout() {
     try { await profileService.logout(); } catch { /* session may be gone */ }
     window.location.reload();
+  }
+
+  async function submitAppleForm() {
+    if (!appleForm?.address || !appleForm?.appPassword) return;
+    setConnecting("apple");
+    try {
+      const acc = await liveMailService.connectApple(appleForm.address, appleForm.appPassword);
+      setAccounts((prev) => [...prev.filter((a) => a.id !== acc.id), acc]);
+      setActiveAccountId(acc.id);
+      setActiveFolder("inbox");
+      setAppleForm(null);
+      setShowConnect(false);
+      loadMailFolder(acc.id, "inbox");
+    } catch (e) {
+      setAppleForm((f) => ({ ...f, error: e.message }));
+    } finally {
+      setConnecting(null);
+    }
   }
 
   function saveLabel(id, value) {
@@ -1604,6 +1720,7 @@ export default function Beacon() {
                       onClick={() => {
                         setActiveFolder(f.id);
                         setSelectedId(null);
+                        loadMailFolder(activeAccount.id, f.id);
                       }}
                     >
                       <Icon size={17} strokeWidth={2} />
@@ -1765,27 +1882,64 @@ export default function Beacon() {
 
       {/* ---------- connect modal ---------- */}
       {showConnect && (
-        <Modal onClose={() => !connecting && setShowConnect(false)}>
+        <Modal onClose={() => { if (!connecting) { setShowConnect(false); setAppleForm(null); } }}>
           <h2 className="modal-title">Connect an account</h2>
           <p className="modal-sub">Sign in with your provider to add a mailbox or Slack workspace.</p>
+          {appleForm ? (
+            <div className="apple-form">
+              <p className="apple-form-hint">
+                iCloud uses an app-specific password. Create one at account.apple.com →
+                Sign-In and Security, then enter it below.
+              </p>
+              <input
+                type="email"
+                placeholder="iCloud email"
+                value={appleForm.address}
+                onChange={(e) => setAppleForm((f) => ({ ...f, address: e.target.value }))}
+                autoFocus
+              />
+              <input
+                type="password"
+                placeholder="App-specific password"
+                value={appleForm.appPassword}
+                onChange={(e) => setAppleForm((f) => ({ ...f, appPassword: e.target.value }))}
+                onKeyDown={(e) => e.key === "Enter" && submitAppleForm()}
+              />
+              {appleForm.error && <div className="auth-error">{appleForm.error}</div>}
+              <div className="apple-form-actions">
+                <button className="auth-submit sm" onClick={submitAppleForm} disabled={connecting === "apple"}>
+                  {connecting === "apple" ? "Connecting…" : "Connect iCloud"}
+                </button>
+                <button className="auth-switch" onClick={() => setAppleForm(null)}>Back</button>
+              </div>
+            </div>
+          ) : (
           <div className="provider-grid">
-            {Object.entries(PROVIDERS).map(([key, p]) => (
+            {Object.entries(PROVIDERS).map(([key, p]) => {
+              const teamsDisabled = !!BACKEND && key === "teams";
+              return (
               <button
                 key={key}
                 className="provider-btn"
-                disabled={!!connecting}
+                disabled={!!connecting || teamsDisabled}
                 onClick={() => connect(key)}
               >
                 <span className="provider-mark" style={{ background: p.gradient }}>
                   {p.badge || <AppleGlyph size={18} />}
                 </span>
                 <span className="provider-name">
-                  {connecting === key ? "Connecting…" : `Continue with ${p.name}`}
+                  {connecting === key
+                    ? "Connecting…"
+                    : teamsDisabled
+                    ? `${p.name} — coming soon`
+                    : `Continue with ${p.name}`}
                 </span>
                 {connecting === key && <RefreshCw size={16} className="spin" />}
               </button>
-            ))}
+              );
+            })}
           </div>
+          )}
           <p className="modal-note">
             Real sign-in runs an OAuth flow on your backend (Gmail API, Microsoft Graph,
             iCloud IMAP, Slack Web API, Teams via Graph). This demo simulates the result.
@@ -3012,7 +3166,7 @@ function Reader({ m, account, onStar }) {
         </div>
 
         <div className="reader-body">
-          {m.body.split("\n").map((line, i) =>
+          {(m.body || m.preview || "").split("\n").map((line, i) =>
             line.trim() === "" ? <br key={i} /> : <p key={i}>{line}</p>
           )}
         </div>
@@ -3887,6 +4041,16 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .tm-bubble.mine{background:#E8EBFA; border-color:#D6DAF5}
 .tm-bubble-row.mine .tm-reactions{justify-content:flex-end}
 .tm-bubble-row.mine .sl-emoji-pop{left:auto; right:0}
+
+/* apple connect form */
+.apple-form{display:flex; flex-direction:column; gap:10px}
+.apple-form-hint{margin:0; font-size:12.5px; color:var(--ink-2); line-height:1.55}
+.apple-form input{
+  border:1px solid var(--line); border-radius:9px; padding:10px 12px; font-size:13.5px;
+  font-family:inherit; outline:none;
+}
+.apple-form input:focus{border-color:var(--accent)}
+.apple-form-actions{display:flex; align-items:center; gap:12px; margin-top:2px}
 
 /* ===== home empty states ===== */
 .qa-cta{

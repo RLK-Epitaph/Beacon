@@ -55,6 +55,16 @@ function validPassword(pw) {
   return typeof pw === "string" && pw.length >= 8 && pw.length <= 128;
 }
 
+// POST /api/dev/reset — DEV ONLY: wipe all users, accounts, and tokens, and
+// end the current session. Refuses to run in production.
+apiRouter.post("/dev/reset", (req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    return res.status(403).json({ error: "Disabled in production" });
+  }
+  store.reset();
+  req.session.destroy(() => res.json({ ok: true, wiped: true }));
+});
+
 // GET /api/me → { user } or { user: null }
 apiRouter.get("/me", (req, res) => {
   const uid = userId(req);
