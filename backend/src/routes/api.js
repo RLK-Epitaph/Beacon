@@ -318,6 +318,18 @@ apiRouter.post("/slack/:accountId/conversations/:channelId/reactions", async (re
   }
 });
 
+// POST /api/slack/:accountId/conversations/:channelId/read → mark read up to now
+apiRouter.post("/slack/:accountId/conversations/:channelId/read", async (req, res) => {
+  const acc = loadSlackAccount(req, res);
+  if (!acc) return;
+  try {
+    await getProvider("slack").markRead(acc, req.params.channelId);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // POST /api/accounts/:accountId/refresh → force an immediate poll, return counts
 apiRouter.post("/accounts/:accountId/refresh", async (req, res) => {
   const acc = loadAccount(req, res);

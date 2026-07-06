@@ -6,6 +6,7 @@ import { config, providerConfigured } from "./config.js";
 import { authRouter } from "./routes/auth.js";
 import { apiRouter } from "./routes/api.js";
 import { syncEngine } from "./sync.js";
+import { FileSessionStore } from "./sessionStore.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -25,6 +26,7 @@ app.use(cookieParser());
 const secureCookies = config.serverOrigin.startsWith("https");
 app.use(
   session({
+    store: new FileSessionStore(),
     secret: config.sessionSecret,
     resave: false,
     saveUninitialized: false,

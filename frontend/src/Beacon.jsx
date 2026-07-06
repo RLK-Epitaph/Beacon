@@ -685,6 +685,9 @@ const liveSlackService = {
       body: JSON.stringify({ timestamp, emoji, add }),
     });
   },
+  async markRead(accountId, channelId) {
+    await backendApi(`/api/slack/${accountId}/conversations/${channelId}/read`, { method: "POST" });
+  },
 };
 
 const profileService = {
@@ -895,21 +898,28 @@ export default function Beacon() {
   const [teamsOrgs, setTeamsOrgs] = useState([]);
   const [teamsSel, setTeamsSel] = useState({ teamId: null, channelId: null, chatId: null });
 
-  useEffect(() => {
-    Promise.all([
+  // Loads accounts/workspaces/teams/events for whichever session is
+  // currently authenticated. Called on mount AND right after a successful
+  // login — otherwise a login that happens after the mount-time fetch (which
+  // ran while logged out and got empty/401 results) would leave the UI
+  // showing no connected accounts until the user reconnects everything.
+  async function loadWorkspaceData() {
+    const [accs, wss, tms] = await Promise.all([
       BACKEND ? liveMailService.listAccounts().catch((e) => { console.warn("Mail unavailable:", e.message); return []; }) : mailService.listAccounts(),
       slackAPI.listWorkspaces().catch((e) => { console.warn("Slack unavailable:", e.message); return []; }),
       BACKEND ? Promise.resolve([]) : teamsService.listAccounts(),
-    ]).then(async ([accs, wss, tms]) => {
-      setAccounts(accs);
-      setWorkspaces(wss);
-      setTeamsOrgs(tms);
-      // Aggregate calendar events across the configured email accounts.
-      const evs = await calendarService.listEvents(accs.map((a) => a.id));
-      setEvents(evs);
-      // Start on the home screen (activeAccountId stays null).
-      setLoading(false);
-    });
+    ]);
+    setAccounts(accs);
+    setWorkspaces(wss);
+    setTeamsOrgs(tms);
+    // Aggregate calendar events across the configured email accounts.
+    const evs = await calendarService.listEvents(accs.map((a) => a.id));
+    setEvents(evs);
+    setLoading(false);
+  }
+
+  useEffect(() => {
+    loadWorkspaceData();
     profileService
       .get()
       .then(setProfile)
@@ -920,7 +930,7 @@ export default function Beacon() {
   // Track the active view in a ref so the long-lived SSE handler always sees
   // the current selection without re-subscribing.
   const activeViewRef = useRef({});
-  activeViewRef.current = { activeAccountId, activeFolder };
+  activeViewRef.current = { activeAccountId, activeFolder, activeChannelId, selectedId };
 
   // Real-time: subscribe to the backend's unread-change stream. When the
   // account being viewed changes, refetch its open folder so new mail appears
@@ -951,6 +961,11 @@ export default function Beacon() {
                 : w
             )
           );
+          // Badge counts alone don't surface new messages — if the channel
+          // currently open belongs to this workspace, pull its latest
+          // history so new messages actually show up without a reload.
+          const { activeAccountId: sAid, activeChannelId: sCid } = activeViewRef.current;
+          if (payload.accountId === sAid && sCid) refetchSlackChannel(sAid, sCid);
           return;
         }
         // Mail change event
@@ -1053,7 +1068,13 @@ export default function Beacon() {
     return list;
   }, [activeAccount, activeFolder, query]);
 
-  const selected = folderMessages.find((m) => m.id === selectedId) || null;
+  // Prefer the filtered list, but fall back to the account's full message set
+  // so an active search query (or a list refresh) never blanks the reader for
+  // an already-open message.
+  const selected =
+    folderMessages.find((m) => m.id === selectedId) ||
+    (activeAccount?.messages || []).find((m) => m.id === selectedId) ||
+    null;
 
   const folderCounts = useMemo(() => {
     const c = {};
@@ -1155,21 +1176,63 @@ export default function Beacon() {
     try {
       const fetched = await liveMailService.listFolderMessages(accountId, folder);
       setAccounts((prev) =>
-        prev.map((a) =>
-          a.id === accountId
-            ? {
-                ...a,
-                messages: [
-                  ...(a.messages || []).filter((m) => (m.folder || "inbox") !== folder),
-                  ...fetched,
-                ],
-                _loadedFolders: { ...(a._loadedFolders || {}), [folder]: true },
-              }
-            : a
-        )
+        prev.map((a) => {
+          if (a.id !== accountId) return a;
+          // A background refetch (e.g. triggered by marking a message read)
+          // that comes back empty is almost always a transient tunnel/network
+          // hiccup, not a genuinely emptied folder — keep what we have rather
+          // than flashing a blank list until the user clicks around.
+          const hadInFolder = (a.messages || []).some((m) => (m.folder || "inbox") === folder);
+          if (fetched.length === 0 && hadInFolder) return a;
+          // listFolderMessages only returns list/preview-level fields — if a
+          // message's full body was already loaded (via openMessage), keep
+          // it, or the open reader flickers from the rendered email back to
+          // just the preview text as soon as the next background poll lands.
+          const prevById = new Map((a.messages || []).map((m) => [m.id, m]));
+          const merged = fetched.map((m) => {
+            const old = prevById.get(m.id);
+            return old && old.body !== undefined
+              ? { ...m, body: old.body, bodyHtml: old.bodyHtml, to: old.to, cc: old.cc, fullDate: old.fullDate, attachments: old.attachments }
+              : m;
+          });
+          // If the message currently open in the reader dropped out of the
+          // fresh page (e.g. it aged past the top 30), keep it so the reader
+          // doesn't suddenly go blank mid-read. It stays until the user
+          // navigates away.
+          const openId = activeViewRef.current.selectedId;
+          const openMsg = openId && prevById.get(openId);
+          if (openMsg && (openMsg.folder || "inbox") === folder && !merged.some((m) => m.id === openId)) {
+            merged.push(openMsg);
+          }
+          return {
+            ...a,
+            messages: [
+              ...(a.messages || []).filter((m) => (m.folder || "inbox") !== folder),
+              ...merged,
+            ],
+            _loadedFolders: { ...(a._loadedFolders || {}), [folder]: true },
+          };
+        })
       );
     } catch (e) {
       console.warn("Refresh failed:", e.message);
+    }
+  }
+
+  // Force-fetch a Slack channel's latest messages (used by SSE change events).
+  async function refetchSlackChannel(accountId, channelId) {
+    if (!BACKEND) return;
+    try {
+      const messages = await liveSlackService.listMessages(accountId, channelId);
+      setWorkspaces((prev) =>
+        prev.map((w) =>
+          w.id === accountId
+            ? { ...w, channels: w.channels.map((c) => (c.id === channelId ? { ...c, messages } : c)) }
+            : w
+        )
+      );
+    } catch (e) {
+      console.warn("Slack refresh failed:", e.message);
     }
   }
 
@@ -1191,7 +1254,11 @@ export default function Beacon() {
     const org = teamsOrgs.find((t) => t.id === id);
     if (!ws && !org) loadMailFolder(id, "inbox");
     if (ws) {
-      setActiveChannelId(ws.channels[0]?.id ?? null);
+      // Prefer a channel with unread activity, then the most recently active
+      // one, so a freshly opened workspace doesn't land on a stale channel.
+      const firstUnread = ws.channels.find((c) => c.unread > 0);
+      const firstActive = ws.channels.find((c) => c.active !== false);
+      setActiveChannelId((firstUnread || firstActive || ws.channels[0])?.id ?? null);
       setOpenThreadId(null);
     } else if (org) {
       const firstTeam = org.teams[0];
@@ -1205,27 +1272,61 @@ export default function Beacon() {
     }
   }
 
+  // Fetch a channel's history and store it on the workspace. Sets messages to
+  // [] on failure so the stream shows an empty state instead of an endless
+  // spinner. Guarded by an in-flight set so the click handler and the
+  // auto-load effect can't double-fetch the same channel.
+  const channelLoadRef = useRef(new Set());
+  async function loadChannelMessages(accountId, channelId) {
+    const key = `${accountId}:${channelId}`;
+    if (channelLoadRef.current.has(key)) return;
+    channelLoadRef.current.add(key);
+    try {
+      const messages = await liveSlackService.listMessages(accountId, channelId);
+      setWorkspaces((prev) =>
+        prev.map((w) =>
+          w.id === accountId
+            ? { ...w, channels: w.channels.map((c) => (c.id === channelId ? { ...c, messages } : c)) }
+            : w
+        )
+      );
+    } catch (e) {
+      console.warn("Failed to load channel:", e.message);
+      setWorkspaces((prev) =>
+        prev.map((w) =>
+          w.id === accountId
+            ? { ...w, channels: w.channels.map((c) => (c.id === channelId && c.messages == null ? { ...c, messages: [] } : c)) }
+            : w
+        )
+      );
+    } finally {
+      channelLoadRef.current.delete(key);
+    }
+  }
+
+  // Load the currently-visible channel's history if it hasn't been fetched
+  // yet. Covers the channel selectItem lands on when a workspace is first
+  // opened — that path sets activeChannelId directly and can't fetch inline
+  // (activeAccountId is still stale in its closure), which previously left the
+  // default channel stuck on the loading spinner forever.
+  useEffect(() => {
+    if (!BACKEND || !activeWorkspace || !activeChannel) return;
+    if (activeChannel.messages == null) {
+      loadChannelMessages(activeWorkspace.id, activeChannel.id);
+    }
+  }, [activeWorkspace?.id, activeChannel?.id, activeChannel?.messages]);
+
   async function openChannel(channelId) {
     setActiveChannelId(channelId);
     setOpenThreadId(null);
-    // Live mode: fetch this channel's history the first time it's opened.
+    // Live mode: fetch this channel's history the first time it's opened, and
+    // move Slack's own read cursor (otherwise the next poll tick overwrites
+    // this optimistic "read" state with the real unread count).
     if (BACKEND) {
       const ws = workspaces.find((w) => w.id === activeAccountId);
       const ch = ws?.channels.find((c) => c.id === channelId);
-      if (ch && ch.messages == null) {
-        try {
-          const messages = await liveSlackService.listMessages(activeAccountId, channelId);
-          setWorkspaces((prev) =>
-            prev.map((w) =>
-              w.id === activeAccountId
-                ? { ...w, channels: w.channels.map((c) => (c.id === channelId ? { ...c, messages } : c)) }
-                : w
-            )
-          );
-        } catch (e) {
-          console.warn("Failed to load channel:", e.message);
-        }
-      }
+      if (ch && ch.messages == null) await loadChannelMessages(activeAccountId, channelId);
+      liveSlackService.markRead(activeAccountId, channelId).catch(() => {});
     }
     // Mark channel read locally.
     setWorkspaces((prev) =>
@@ -1648,9 +1749,33 @@ export default function Beacon() {
     if (!read && selectedId === m.id) setSelectedId(null);
   }
 
+  // The send POST can reach the server and actually deliver the mail, yet have
+  // its response lost to tunnel/network lag — surfacing as a "Failed to fetch"
+  // that wrongly looks like the send failed. Before trusting that error, look
+  // for the message in the Sent folder (retrying briefly for provider indexing
+  // lag); if it's there, the send succeeded.
+  async function confirmSent(accountId, subject) {
+    const norm = (subject || "").trim().toLowerCase();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const sent = await liveMailService.listFolderMessages(accountId, "sent");
+        if (sent.some((m) => (m.subject || "").trim().toLowerCase() === norm)) return true;
+      } catch { /* keep trying */ }
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+    return false;
+  }
+
   async function sendEmailReply(orig, { to, subject, html, text }) {
     if (BACKEND) {
-      await liveMailService.send(activeAccountId, { to, subject, body: text, html });
+      try {
+        await liveMailService.send(activeAccountId, { to, subject, body: text, html });
+      } catch (e) {
+        // Only swallow the error if we can positively confirm delivery.
+        if (!(await confirmSent(activeAccountId, subject))) throw e;
+      }
+      // Reflect the new Sent message without waiting for the next poll.
+      refetchFolder(activeAccountId, "sent");
     } else {
       // Mock mode: drop a copy in the Sent folder so the flow feels real.
       const sentMsg = msg("Me", activeAccount.address, subject, text.slice(0, 80), text, {
@@ -1682,7 +1807,7 @@ export default function Beacon() {
         <div className="auth-overlay"><div className="auth-splash">Loading Beacon…</div></div>
       )}
       {BACKEND && profileLoaded && !profile && (
-        <AuthScreen onDone={setProfile} />
+        <AuthScreen onDone={(user) => { setProfile(user); loadWorkspaceData(); }} />
       )}
 
       {/* ---------- account rail ---------- */}
@@ -1705,6 +1830,13 @@ export default function Beacon() {
         </button>
 
         <div className="rail-accounts">
+          {loading ? (
+            <div className="rail-loading" title="Loading your accounts…">
+              <RefreshCw size={16} className="spin" />
+              {railExpanded && <span>Loading accounts…</span>}
+            </div>
+          ) : (
+          <>
           {emailGroups.map((g, gi) => (
             <React.Fragment key={g.key}>
               {!railExpanded && gi > 0 && <div className="rail-group-gap" />}
@@ -1822,6 +1954,8 @@ export default function Beacon() {
               </button>
             );
           })}
+          </>
+          )}
 
           <button
             className={`rail-add ${railExpanded ? "wide" : ""}`}
@@ -1988,6 +2122,7 @@ export default function Beacon() {
           onSelect={selectItem}
           onConnect={() => setShowConnect(true)}
           profile={profile}
+          loading={loading}
         />
       ) : isSlack ? (
         <SlackView
@@ -2115,6 +2250,7 @@ export default function Beacon() {
       <section className="reader">
         {selected ? (
           <Reader
+            key={selected.id}
             m={selected}
             account={activeAccount}
             onStar={(e) => toggleStar(e, selected)}
@@ -2430,7 +2566,7 @@ function SlackListsWidget({ lists = [] }) {
 }
 
 /* ---- Home screen ---- */
-function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAccount, unreadByWorkspace, unreadByTeamsOrg = {}, onSelect, onConnect, profile }) {
+function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAccount, unreadByWorkspace, unreadByTeamsOrg = {}, onSelect, onConnect, profile, loading }) {
   const now = new Date();
   const hour = now.getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
@@ -2462,7 +2598,12 @@ function HomeScreen({ accounts, workspaces, teamsOrgs = [], events, unreadByAcco
           <div className="widget-head">
             <h3><Mail size={15} /> Quick access</h3>
           </div>
-          {accounts.length + workspaces.length + teamsOrgs.length === 0 ? (
+          {loading ? (
+            <div className="qa-cta">
+              <RefreshCw size={20} className="spin" />
+              <span className="qa-cta-sub">Loading your accounts…</span>
+            </div>
+          ) : accounts.length + workspaces.length + teamsOrgs.length === 0 ? (
             <div className="qa-cta">
               <span className="qa-cta-title">Connect your first account</span>
               <span className="qa-cta-sub">Email, Slack, and Teams accounts appear here once connected.</span>
@@ -3110,8 +3251,15 @@ function TeamsView({ org, selection, onSend, onSendChat, onReply, onReact, loadi
 
 /* ---- Slack: channel sidebar ---- */
 function SlackChannelList({ workspace, activeChannel, onOpenChannel, editingLabel, onEditLabel, onSaveLabel, onGoHome }) {
-  const channels = workspace.channels.filter((c) => c.kind === "channel");
-  const dms = workspace.channels.filter((c) => c.kind === "dm");
+  // "active" mirrors Slack's default sidebar: conversations with unread or
+  // activity in the last 30 days (the backend flags these). "all" shows
+  // everything. Mock channels have no `active` field, so they always show.
+  const [filter, setFilter] = useState("active");
+  const isVisible = (c) => filter === "all" || c.active !== false;
+  const visible = workspace.channels.filter(isVisible);
+  const channels = visible.filter((c) => c.kind === "channel");
+  const dms = visible.filter((c) => c.kind === "dm");
+  const hiddenCount = workspace.channels.length - visible.length;
   return (
     <div className="sl-side">
       <div className="sl-ws-head" style={{ background: workspace.accent }}>
@@ -3133,6 +3281,25 @@ function SlackChannelList({ workspace, activeChannel, onOpenChannel, editingLabe
           </button>
         </div>
         <span className="sl-ws-you">{workspace.you}</span>
+      </div>
+
+      <div className="sl-filter" role="tablist" aria-label="Conversation filter">
+        <button
+          role="tab"
+          aria-selected={filter === "active"}
+          className={`sl-filter-btn ${filter === "active" ? "is-active" : ""}`}
+          onClick={() => setFilter("active")}
+        >
+          Active
+        </button>
+        <button
+          role="tab"
+          aria-selected={filter === "all"}
+          className={`sl-filter-btn ${filter === "all" ? "is-active" : ""}`}
+          onClick={() => setFilter("all")}
+        >
+          All{filter === "active" && hiddenCount > 0 ? ` (${hiddenCount})` : ""}
+        </button>
       </div>
 
       <div className="sl-groups">
@@ -3210,7 +3377,15 @@ function SlackView({ workspace, channel, openThread, onOpenThread, onCloseThread
 
         <div className="sl-stream">
           {channel.messages == null ? (
-            <div className="empty">Loading messages…</div>
+            <div className="empty">
+              <RefreshCw size={22} className="spin" />
+              <p>Loading messages…</p>
+            </div>
+          ) : channel.messages.length === 0 ? (
+            <div className="empty">
+              <MessageSquare size={40} strokeWidth={1.3} />
+              <p>No messages yet</p>
+            </div>
           ) : (
           channel.messages.map((m) => (
             <SlackMessage
@@ -3756,6 +3931,12 @@ const CSS = `
 .md-root{
   position:fixed; inset:0; display:grid;
   grid-template-columns:64px 232px 360px 1fr;
+  /* Without an explicit row track, the implicit row auto-sizes to the
+     tallest column's content — so a long message list just grows past the
+     viewport instead of scrolling (overflow:hidden below then clips it).
+     minmax(0,1fr) clamps the row to the container height so children's
+     flex:1/overflow-y:auto panes actually get a bounded height to scroll in. */
+  grid-template-rows:minmax(0, 1fr);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
   background:var(--bg); color:var(--ink); font-size:14px; overflow:hidden;
   transition:grid-template-columns .22s cubic-bezier(.4,0,.2,1);
@@ -3799,6 +3980,11 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
   border-top:1px solid rgba(255,255,255,.07); padding-top:12px;
 }
 .rail.is-expanded .rail-accounts{align-items:stretch; gap:4px}
+.rail-loading{
+  display:flex; align-items:center; justify-content:center; gap:8px;
+  color:#8893a7; font-size:12px; padding:10px 0; width:100%;
+}
+.rail.is-expanded .rail-loading{justify-content:flex-start; padding:10px 4px}
 
 .rail-acc{position:relative; width:44px; height:44px; border-radius:50%; transition:transform .12s; align-self:center}
 .rail-acc:hover{transform:translateY(-1px)}
@@ -3995,7 +4181,7 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .reader-more-menu button:hover{background:var(--line-2)}
 
 .reader-html{
-  width:100%; min-height:420px; border:none; background:var(--panel);
+  width:100%; flex:1; min-height:420px; border:none; background:var(--panel);
   border-radius:10px; margin:20px 0; display:block;
 }
 
@@ -4018,7 +4204,7 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .bar-sep{width:1px; height:20px; background:var(--line); margin:0 6px}
 .reader-acct{font-size:12px; color:var(--ink-3); font-weight:500}
 
-.reader-scroll{overflow-y:auto; flex:1; padding:28px 40px 60px; max-width:860px; width:100%}
+.reader-scroll{overflow-y:auto; flex:1; padding:28px 40px 60px; width:100%; display:flex; flex-direction:column}
 .reader-subject{margin:0 0 22px; font-size:22px; font-weight:700; letter-spacing:-.015em; line-height:1.25}
 .reader-from{display:flex; gap:13px; align-items:center; padding-bottom:22px; border-bottom:1px solid var(--line)}
 .reader-avatar{
@@ -4039,7 +4225,7 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 }
 .att-name{font-weight:600; color:var(--ink)}
 .att-size{color:var(--ink-3)}
-.reader-reply{display:flex; gap:10px; padding-top:20px; border-top:1px solid var(--line)}
+.reader-reply{display:flex; gap:10px; padding-top:20px; border-top:1px solid var(--line); flex-shrink:0}
 .reply-btn{
   display:flex; align-items:center; gap:7px; background:var(--accent); color:#fff;
   font-weight:600; font-size:13px; padding:9px 16px; border-radius:9px; transition:.15s;
@@ -4130,6 +4316,13 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .sl-ws-you{font-size:12px; color:rgba(255,255,255,.7); display:flex; align-items:center; gap:6px; margin-top:3px}
 .sl-ws-you::before{content:""; width:8px; height:8px; border-radius:50%; background:#2EB67D; box-shadow:0 0 0 2px rgba(255,255,255,.25)}
 
+.sl-filter{display:flex; gap:4px; padding:10px 12px 0}
+.sl-filter-btn{
+  flex:1; padding:5px 10px; border-radius:7px; font-size:12px; font-weight:600;
+  color:var(--ink-3); background:var(--line-2); transition:.1s;
+}
+.sl-filter-btn:hover{color:var(--ink-2)}
+.sl-filter-btn.is-active{background:var(--accent); color:#fff}
 .sl-groups{flex:1; overflow-y:auto; padding:12px 8px}
 .sl-group{margin-bottom:18px}
 .sl-group-title{
@@ -4565,6 +4758,9 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .rc{
   margin-top:20px; background:var(--panel); border:1px solid var(--line); border-radius:14px;
   box-shadow:var(--shadow); overflow:hidden;
+  /* The reader body is a flex column (so HTML emails fill the pane); without
+     this the composer gets shrunk to nothing and its editor is unusable. */
+  flex-shrink:0;
 }
 .rc-head{
   display:flex; align-items:center; justify-content:space-between; padding:12px 16px;
@@ -4601,8 +4797,8 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 }
 .rc-tool:hover{background:var(--line-2); color:var(--ink)}
 .rc-editor{
-  min-height:140px; max-height:320px; overflow-y:auto; padding:14px 16px; font-size:14px;
-  line-height:1.6; outline:none;
+  min-height:180px; max-height:50vh; overflow-y:auto; padding:14px 16px; font-size:14px;
+  line-height:1.6; outline:none; resize:vertical;
 }
 .rc-editor:focus{background:#fdfdfe}
 .rc-editor ul,.rc-editor ol{padding-left:22px; margin:6px 0}
