@@ -1,0 +1,4 @@
+# Normalize line endings: store text as LF in the repo and check it out as LF
+# on every platform, so Windows checkouts stop warning about LF↔CRLF conversion.
+# text=auto lets Git auto-detect binaries and leave them untouched.
+* text=auto eol=lf
