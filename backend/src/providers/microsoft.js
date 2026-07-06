@@ -211,6 +211,80 @@ export const microsoftProvider = {
       },
     });
   },
+
+  /* ---- Microsoft Teams (chats) ----
+     Teams runs on the same Microsoft identity as Outlook mail, so these reuse
+     this account's Graph token. Scoped to CHATS (1:1 + group DMs) via
+     Chat.ReadWrite — team CHANNELS need ChannelMessage.Read.All (admin consent)
+     and are intentionally excluded here. */
+
+  // Basic identity for the Teams "org" header + resolving 1:1 chat names.
+  async teamsIdentity(account) {
+    const me = await graph(account, "/me?$select=id,displayName,mail,userPrincipalName");
+    const addr = me.mail || me.userPrincipalName || account.address;
+    return { id: me.id, name: me.displayName || addr, org: orgFromAddress(addr) };
+  },
+
+  // List the signed-in user's chats. Names mirror the Teams client: the OTHER
+  // person for 1:1s, the topic (or member first-names) for groups. `unread` is
+  // derived from the last-read vs last-message timestamps in the chat viewpoint.
+  async listChats(account) {
+    const me = await graph(account, "/me?$select=id");
+    const myId = me.id;
+    const res = await graph(
+      account,
+      "/me/chats?$expand=members,lastMessagePreview&$top=50&$orderby=lastMessagePreview/createdDateTime desc"
+    );
+    const chats = [];
+    for (const c of res.value || []) {
+      const others = (c.members || []).filter((m) => m.userId && m.userId !== myId);
+      let name;
+      let kind;
+      if (c.chatType === "oneOnOne") {
+        kind = "chat";
+        name = others[0]?.displayName || "Direct chat";
+      } else {
+        kind = "group";
+        name =
+          c.topic ||
+          others.map((m) => (m.displayName || "").split(" ")[0]).filter(Boolean).join(", ") ||
+          "Group chat";
+      }
+      const last = c.lastMessagePreview;
+      const lastRead = c.viewpoint?.lastMessageReadDateTime;
+      const unread =
+        last?.createdDateTime &&
+        lastRead &&
+        new Date(last.createdDateTime) > new Date(lastRead) &&
+        last.from?.user?.id !== myId
+          ? 1
+          : 0;
+      chats.push({ id: c.id, name, kind, unread, messages: null });
+    }
+    return chats;
+  },
+
+  async listChatMessages(account, chatId, { limit = 30 } = {}) {
+    const me = await graph(account, "/me?$select=id");
+    const res = await graph(account, `/chats/${chatId}/messages?$top=${limit}`);
+    const msgs = (res.value || [])
+      .filter((m) => m.messageType === "message" && (m.body?.content || "").trim())
+      .map((m) => ({
+        id: m.id,
+        author: m.from?.user?.displayName || "Unknown",
+        text: (m.body?.contentType || "").toLowerCase() === "html" ? stripHtml(m.body.content) : m.body?.content || "",
+        time: formatTeamsTime(m.createdDateTime),
+        reactions: groupTeamsReactions(m.reactions, me.id),
+      }));
+    return msgs.reverse(); // Graph returns newest-first; the stream wants oldest-first
+  },
+
+  async sendChatMessage(account, chatId, text) {
+    return graph(account, `/chats/${chatId}/messages`, {
+      method: "POST",
+      body: { body: { contentType: "text", content: text } },
+    });
+  },
 };
 
 function stripHtml(html) {
@@ -220,4 +294,35 @@ function stripHtml(html) {
     .replace(/&nbsp;/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function orgFromAddress(addr) {
+  const domain = (addr.split("@")[1] || "").split(".")[0];
+  return domain ? domain[0].toUpperCase() + domain.slice(1) : "Microsoft";
+}
+
+// Show a clock time for today's messages, otherwise a short date — matching how
+// the Teams client labels messages.
+function formatTeamsTime(iso) {
+  const d = new Date(iso);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  return sameDay
+    ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+const TEAMS_REACTION_EMOJI = {
+  like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😠",
+};
+function groupTeamsReactions(list = [], myId) {
+  const map = new Map();
+  for (const r of list) {
+    const emoji = TEAMS_REACTION_EMOJI[r.reactionType] || "👍";
+    const e = map.get(emoji) || { emoji, count: 0, mine: false };
+    e.count++;
+    if (r.user?.user?.id === myId) e.mine = true;
+    map.set(emoji, e);
+  }
+  return [...map.values()];
 }

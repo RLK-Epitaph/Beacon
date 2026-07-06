@@ -252,29 +252,52 @@ function loadSlackAccount(req, res) {
   return acc;
 }
 
-// GET /api/slack/:accountId/conversations → channels + DMs
+// GET /api/slack/:accountId/conversations → channels + DMs (+ who you are)
 apiRouter.get("/slack/:accountId/conversations", async (req, res) => {
   const acc = loadSlackAccount(req, res);
   if (!acc) return;
   try {
-    const conversations = await getProvider("slack").listConversations(acc);
-    res.json({ conversations, team: acc.secrets?.team_name });
+    const slack = getProvider("slack");
+    const conversations = await slack.listConversations(acc);
+    const self = await slack.getSelf(acc).catch(() => null);
+    res.json({ conversations, team: acc.secrets?.team_name, self });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
 });
+
+// GET /api/slack/:accountId/members → workspace directory for @mentions
+apiRouter.get("/slack/:accountId/members", async (req, res) => {
+  const acc = loadSlackAccount(req, res);
+  if (!acc) return;
+  try {
+    const members = await getProvider("slack").listMembers(acc);
+    res.json({ members });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Slack rate limits (esp. conversations.history at ~1/min) surface as HTTP 429
+// with a retryAfter the client uses to schedule an automatic retry.
+function slackError(res, e) {
+  if (e.rateLimited) {
+    return res.status(429).json({ error: "Slack is rate-limiting this request", retryAfter: e.retryAfter || 60 });
+  }
+  res.status(502).json({ error: e.message });
+}
 
 // GET /api/slack/:accountId/conversations/:channelId/messages
 apiRouter.get("/slack/:accountId/conversations/:channelId/messages", async (req, res) => {
   const acc = loadSlackAccount(req, res);
   if (!acc) return;
   try {
-    const messages = await getProvider("slack").listMessages(acc, req.params.channelId, {
+    const { messages, stale } = await getProvider("slack").listMessages(acc, req.params.channelId, {
       limit: Math.min(Number(req.query.limit) || 30, 100),
     });
-    res.json({ messages });
+    res.json({ messages, stale });
   } catch (e) {
-    res.status(502).json({ error: e.message });
+    slackError(res, e);
   }
 });
 
@@ -286,7 +309,7 @@ apiRouter.get("/slack/:accountId/conversations/:channelId/thread/:ts", async (re
     const messages = await getProvider("slack").listReplies(acc, req.params.channelId, req.params.ts);
     res.json({ messages });
   } catch (e) {
-    res.status(502).json({ error: e.message });
+    slackError(res, e);
   }
 });
 
@@ -325,6 +348,82 @@ apiRouter.post("/slack/:accountId/conversations/:channelId/read", async (req, re
   try {
     await getProvider("slack").markRead(acc, req.params.channelId);
     res.json({ ok: true });
+  } catch (e) {
+    // Surface this in the server log — a missing_scope here means the
+    // workspace was connected before the *:write scopes were added and needs
+    // to be reconnected, otherwise read state never syncs back to Slack.
+    console.warn(`[slack] mark-read failed for ${req.params.channelId}: ${e.message}`);
+    res.status(502).json({ error: e.message });
+  }
+});
+
+/* ---- teams (chats) ----
+   Teams is powered by the same Microsoft account as Outlook mail. Each connected
+   Microsoft account surfaces as one Teams "org" whose chats come from Graph.
+   Channels are omitted (they require admin-consented ChannelMessage.Read.All). */
+
+function loadTeamsAccount(req, res) {
+  const acc = loadAccount(req, res);
+  if (acc && acc.provider !== "microsoft") {
+    res.status(400).json({ error: "Not a Microsoft account" });
+    return null;
+  }
+  return acc;
+}
+
+// GET /api/teams → one org per connected Microsoft account, with its chats
+apiRouter.get("/teams", async (req, res) => {
+  const accounts = store.listRawForUser(userId(req)).filter((a) => a.provider === "microsoft");
+  const ms = getProvider("microsoft");
+  const orgs = [];
+  for (const acc of accounts) {
+    try {
+      const [identity, chats] = await Promise.all([ms.teamsIdentity(acc), ms.listChats(acc)]);
+      orgs.push({
+        id: acc.id,
+        provider: "teams",
+        org: identity.org,
+        label: acc.label || identity.org,
+        address: acc.address,
+        you: identity.name,
+        teams: [], // channels require admin consent — chats only for now
+        chats,
+      });
+    } catch (e) {
+      // A Microsoft account whose consent predates the Teams scopes will 403
+      // here; surface it as an org with no chats rather than failing the list.
+      orgs.push({
+        id: acc.id, provider: "teams", org: acc.address, label: acc.label || acc.address,
+        address: acc.address, you: "You", teams: [], chats: [], error: e.message,
+      });
+    }
+  }
+  res.json({ orgs });
+});
+
+// GET /api/teams/:accountId/chats/:chatId/messages
+apiRouter.get("/teams/:accountId/chats/:chatId/messages", async (req, res) => {
+  const acc = loadTeamsAccount(req, res);
+  if (!acc) return;
+  try {
+    const messages = await getProvider("microsoft").listChatMessages(acc, req.params.chatId, {
+      limit: Math.min(Number(req.query.limit) || 30, 50),
+    });
+    res.json({ messages });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// POST /api/teams/:accountId/chats/:chatId/messages { text }
+apiRouter.post("/teams/:accountId/chats/:chatId/messages", async (req, res) => {
+  const acc = loadTeamsAccount(req, res);
+  if (!acc) return;
+  const { text } = req.body || {};
+  if (!text) return res.status(400).json({ error: "text is required" });
+  try {
+    await getProvider("microsoft").sendChatMessage(acc, req.params.chatId, text);
+    res.json({ sent: true });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }

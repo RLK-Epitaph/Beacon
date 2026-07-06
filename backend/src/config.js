@@ -39,6 +39,11 @@ export const config = {
       "User.Read",
       "Mail.ReadWrite",
       "Mail.Send",
+      // NOTE: no Teams scopes here. Chat.ReadWrite is normally user-consentable,
+      // but this tenant blocks all user consent ("needs admin approval"), and
+      // including it would block the MAIL connect too. Re-add once a tenant
+      // admin grants the Beacon app consent — the Teams chat backend
+      // (providers/microsoft.js + /api/teams) is built and dormant.
     ],
   },
 
@@ -46,11 +51,16 @@ export const config = {
     clientId: process.env.SLACK_CLIENT_ID || "",
     clientSecret: process.env.SLACK_CLIENT_SECRET || "",
     // User-token scopes — Beacon acts as the signed-in person, not a bot.
+    // The *:write scopes are required by conversations.mark (moving the read
+    // cursor when a channel is opened) — without them, mark-as-read silently
+    // fails with missing_scope and unread state never clears on Slack's side.
+    // Workspaces connected before these were added must be RECONNECTED to
+    // grant them (Connect account → Slack; tokens refresh in place).
     userScopes: [
-      "channels:read", "channels:history",
-      "groups:read", "groups:history",
-      "im:read", "im:history",
-      "mpim:read", "mpim:history",
+      "channels:read", "channels:history", "channels:write",
+      "groups:read", "groups:history", "groups:write",
+      "im:read", "im:history", "im:write",
+      "mpim:read", "mpim:history", "mpim:write",
       "chat:write", "reactions:read", "reactions:write",
       "users:read",
     ],

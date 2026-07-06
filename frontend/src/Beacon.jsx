@@ -184,6 +184,7 @@ function smsg(author, text, opts = {}) {
     author,
     text,
     time: opts.time || "10:24 AM",
+    mentionsMe: opts.mentionsMe || false,
     reactions: opts.reactions || [], // [{ emoji, count }]
     replies: opts.replies || [],     // nested smsg() objects (one level: a thread)
   };
@@ -214,8 +215,9 @@ const SLACK_WORKSPACES = [
               smsg("Marcus Chen", "Perfect, thank you!", { time: "8:37 AM" }),
             ],
           }),
-          smsg("Priya Shah", "Quick heads up: the office will be closed Friday for maintenance.", {
+          smsg("Priya Shah", "{{@mock_alex|Alex Rivera|me}} quick heads up: the office will be closed Friday for maintenance.", {
             time: "9:15 AM",
+            mentionsMe: true,
             reactions: [{ emoji: "🙏", count: 6 }],
           }),
         ],
@@ -622,12 +624,16 @@ async function backendApi(path, options = {}) {
   const isJson = (res.headers.get("content-type") || "").includes("application/json");
   if (!res.ok || !isJson) {
     const body = isJson ? await res.json().catch(() => ({})) : {};
-    throw new Error(
+    const err = new Error(
       body.error ||
         (!isJson
           ? "Backend returned a non-JSON response (tunnel interstitial or server offline)"
           : `Request failed: ${res.status}`)
     );
+    // Callers use these to react to rate limits (auto-retry with backoff).
+    err.status = res.status;
+    if (body.retryAfter) err.retryAfter = body.retryAfter;
+    throw err;
   }
   return res.json();
 }
@@ -642,16 +648,18 @@ const liveSlackService = {
     return Promise.all(
       slackAccounts.map(async (a) => {
         let channels = [];
+        let self = null;
         try {
           const r = await backendApi(`/api/slack/${a.id}/conversations`);
           channels = r.conversations.map((c) => ({ ...c, messages: null }));
+          self = r.self || null;
         } catch (e) {
           console.warn("Slack conversations failed:", e.message);
         }
         return {
           id: a.id, kind: "slack", provider: "slack",
           workspace: a.address, label: a.label || a.address, address: a.address,
-          accent: "#4A154B", you: "You", channels,
+          accent: "#4A154B", you: self?.name || "You", selfId: self?.id || null, channels,
         };
       })
     );
@@ -687,6 +695,10 @@ const liveSlackService = {
   },
   async markRead(accountId, channelId) {
     await backendApi(`/api/slack/${accountId}/conversations/${channelId}/read`, { method: "POST" });
+  },
+  async listMembers(accountId) {
+    const { members } = await backendApi(`/api/slack/${accountId}/members`);
+    return members;
   },
 };
 
@@ -826,6 +838,27 @@ const teamsService = {
   async toggleReaction() { return true; },
 };
 
+/* ---- live teams service (Microsoft Graph, via the Beacon backend) --------- */
+// Each connected Microsoft account surfaces as one Teams org. Scoped to chats
+// (1:1 + group) — channels need admin-consented scopes and stay mocked. Chat
+// messages load lazily per chat (messages: null until opened), like Slack.
+const liveTeamsService = {
+  async listAccounts() {
+    const { orgs } = await backendApi("/api/teams");
+    return orgs.map((o) => ({ ...o, kind: "teams" }));
+  },
+  async listChatMessages(accountId, chatId) {
+    const { messages } = await backendApi(`/api/teams/${accountId}/chats/${chatId}/messages`);
+    return messages.map((m) => ({ ...m, reactions: m.reactions || [], replies: [] }));
+  },
+  async sendChat(accountId, chatId, text) {
+    await backendApi(`/api/teams/${accountId}/chats/${chatId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+  },
+};
+
 /* ---- calendar service (aggregates events across email accounts) ---------- */
 
 const calendarService = {
@@ -866,7 +899,38 @@ function avatarColor(seed) {
   return palette[h];
 }
 
+// Render Slack message text containing the backend's mention/link tokens —
+// {{@id|Name}}, {{@id|Name|me}}, {{@|here}}, {{#|channel}}, {{L|url|label}} —
+// as styled chips/links. Plain text (mock data, no tokens) passes through as-is.
+function renderSlackText(text) {
+  const parts = String(text ?? "").split(/(\{\{[^{}]+\}\})/g);
+  return parts.map((p, i) => {
+    const m = p.match(/^\{\{([@#L])([^|}]*)\|([^|}]*)(\|me)?\}\}$/);
+    if (!m) return p;
+    const [, type, a, b, me] = m;
+    if (type === "L") {
+      return (
+        <a key={i} className="sl-link" href={a} target="_blank" rel="noreferrer">
+          {b || a}
+        </a>
+      );
+    }
+    if (type === "#") return <span key={i} className="sl-mention">#{b}</span>;
+    return (
+      <span key={i} className={`sl-mention ${me ? "me" : ""}`}>
+        @{b}
+      </span>
+    );
+  });
+}
+
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /* ================================ app ===================================== */
+
+// Sentinel channel id for the Slack "Threads" view (an all-threads aggregation
+// rather than a real conversation).
+const THREADS_VIEW_ID = "__threads__";
 
 export default function Beacon() {
   const [accounts, setAccounts] = useState([]);
@@ -890,6 +954,33 @@ export default function Beacon() {
   // Slack-specific UI state
   const [activeChannelId, setActiveChannelId] = useState(null);
   const [openThreadId, setOpenThreadId] = useState(null);
+  // Resizable Slack panes (px): channel sidebar + thread pane widths.
+  const [slackSideW, setSlackSideW] = useState(232);
+  const [slackThreadW, setSlackThreadW] = useState(420);
+
+  // Generic horizontal drag-to-resize: tracks pointer delta and feeds it to
+  // `apply(startWidth, deltaX)`, clamped by the caller. Uses window listeners
+  // so the drag keeps working if the pointer leaves the thin handle.
+  function beginResize(e, startWidth, apply) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const onMove = (ev) => apply(startWidth, ev.clientX - startX);
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+  const startSideResize = (e) =>
+    beginResize(e, slackSideW, (w, dx) => setSlackSideW(Math.max(180, Math.min(460, w + dx))));
+  // Thread pane sits on the right, so dragging its handle left widens it.
+  const startThreadResize = (e) =>
+    beginResize(e, slackThreadW, (w, dx) => setSlackThreadW(Math.max(300, Math.min(760, w - dx))));
   // User profile: null until loaded; live mode may require onboarding.
   const [profile, setProfile] = useState(null);
   const [profileLoaded, setProfileLoaded] = useState(false);
@@ -907,6 +998,9 @@ export default function Beacon() {
     const [accs, wss, tms] = await Promise.all([
       BACKEND ? liveMailService.listAccounts().catch((e) => { console.warn("Mail unavailable:", e.message); return []; }) : mailService.listAccounts(),
       slackAPI.listWorkspaces().catch((e) => { console.warn("Slack unavailable:", e.message); return []; }),
+      // Live Teams is parked: the tenant requires admin consent for Graph chat
+      // scopes, so there's no data to show — no Teams orgs in the rail. Mock
+      // mode keeps the demo orgs. (liveTeamsService stays ready for later.)
       BACKEND ? Promise.resolve([]) : teamsService.listAccounts(),
     ]);
     setAccounts(accs);
@@ -930,7 +1024,7 @@ export default function Beacon() {
   // Track the active view in a ref so the long-lived SSE handler always sees
   // the current selection without re-subscribing.
   const activeViewRef = useRef({});
-  activeViewRef.current = { activeAccountId, activeFolder, activeChannelId, selectedId };
+  activeViewRef.current = { activeAccountId, activeFolder, activeChannelId, selectedId, openThreadId };
 
   // Real-time: subscribe to the backend's unread-change stream. When the
   // account being viewed changes, refetch its open folder so new mail appears
@@ -946,17 +1040,25 @@ export default function Beacon() {
           // reflect counts onto the loaded channel list so unread shows inline.
           setLiveSlackUnread((prev) => ({
             ...prev,
-            [payload.accountId]: { total: payload.slackUnread || 0, byChannel: payload.byChannel || {} },
+            [payload.accountId]: {
+              total: payload.slackUnread || 0,
+              byChannel: payload.byChannel || {},
+              dmUnread: payload.dmUnread || 0,
+            },
           }));
           setWorkspaces((prev) =>
             prev.map((w) =>
               w.id === payload.accountId
                 ? {
                     ...w,
-                    channels: w.channels.map((c) => ({
-                      ...c,
-                      unread: payload.byChannel?.[c.id] ?? 0,
-                    })),
+                    channels: w.channels.map((c) => {
+                      const unread = payload.byChannel?.[c.id] ?? 0;
+                      // A conversation that just received messages must become
+                      // visible even if it was idle when the workspace loaded —
+                      // `active` is computed at load time, so without this a
+                      // fresh DM stays hidden behind the "Active" filter.
+                      return { ...c, unread, active: unread > 0 ? true : c.active };
+                    }),
                   }
                 : w
             )
@@ -964,8 +1066,12 @@ export default function Beacon() {
           // Badge counts alone don't surface new messages — if the channel
           // currently open belongs to this workspace, pull its latest
           // history so new messages actually show up without a reload.
-          const { activeAccountId: sAid, activeChannelId: sCid } = activeViewRef.current;
-          if (payload.accountId === sAid && sCid) refetchSlackChannel(sAid, sCid);
+          const { activeAccountId: sAid, activeChannelId: sCid, openThreadId: sTid } = activeViewRef.current;
+          if (payload.accountId === sAid && sCid) {
+            refetchSlackChannel(sAid, sCid);
+            // Keep an open thread live too, so new replies appear without reopening.
+            if (sTid) loadThreadReplies(sAid, sCid, sTid);
+          }
           return;
         }
         // Mail change event
@@ -1124,9 +1230,22 @@ export default function Beacon() {
     return map;
   }, [workspaces, liveSlackUnread]);
 
+  // Unread that's aimed at YOU (DMs + group DMs) — this drives the mail-style
+  // numeric badge; plain channel activity gets a subtler dot instead.
+  const dmUnreadByWorkspace = useMemo(() => {
+    const map = {};
+    for (const w of workspaces) {
+      map[w.id] =
+        BACKEND && liveSlackUnread[w.id]
+          ? liveSlackUnread[w.id].dmUnread || 0
+          : w.channels.filter((c) => c.kind === "dm").reduce((sum, c) => sum + (c.unread || 0), 0);
+    }
+    return map;
+  }, [workspaces, liveSlackUnread]);
+
   // Active Slack channel + its thread, when a workspace is open.
   const activeChannel = useMemo(() => {
-    if (!activeWorkspace) return null;
+    if (!activeWorkspace || activeChannelId === THREADS_VIEW_ID) return null;
     return (
       activeWorkspace.channels.find((c) => c.id === activeChannelId) ||
       activeWorkspace.channels[0] ||
@@ -1138,6 +1257,45 @@ export default function Beacon() {
     if (!activeChannel || !openThreadId) return null;
     return (activeChannel.messages || []).find((m) => m.id === openThreadId) || null;
   }, [activeChannel, openThreadId]);
+
+  // Workspace directory for @mention autocomplete. Live mode fetches the real
+  // member list; mock mode derives names from whoever appears in the messages.
+  const slackMembers = useMemo(() => {
+    if (!activeWorkspace) return [];
+    if (activeWorkspace.members?.length) return activeWorkspace.members;
+    const names = new Set();
+    for (const c of activeWorkspace.channels) {
+      for (const m of c.messages || []) if (m.author) names.add(m.author);
+    }
+    names.delete(activeWorkspace.you);
+    return [...names].map((n) => ({ id: `mock_${n}`, name: n }));
+  }, [activeWorkspace]);
+
+  useEffect(() => {
+    if (!BACKEND || !activeWorkspace || activeWorkspace.members) return;
+    const wsId = activeWorkspace.id;
+    liveSlackService
+      .listMembers(wsId)
+      .then((members) =>
+        setWorkspaces((prev) => prev.map((w) => (w.id === wsId ? { ...w, members } : w)))
+      )
+      .catch((e) => console.warn("Slack members failed:", e.message));
+  }, [activeWorkspace?.id]);
+
+  // All threads across the workspace's loaded channels — powers the "Threads"
+  // view. A message counts as a thread once it has replies (or a reply count).
+  const allThreads = useMemo(() => {
+    if (!activeWorkspace) return [];
+    const out = [];
+    for (const c of activeWorkspace.channels) {
+      for (const m of c.messages || []) {
+        if ((m.replies?.length || m.replyCount || 0) > 0) {
+          out.push({ channelId: c.id, channelName: c.name, channelKind: c.kind, parent: m });
+        }
+      }
+    }
+    return out;
+  }, [activeWorkspace]);
 
   function goHome() {
     setShowProfile(false);
@@ -1220,14 +1378,43 @@ export default function Beacon() {
   }
 
   // Force-fetch a Slack channel's latest messages (used by SSE change events).
+  // Slack's history budget is ~1 call/minute per workspace and it's shared with
+  // interactive channel opens, so background refetches are throttled per
+  // account: at most one per 55s, with a deferred pass so the newest messages
+  // still land once the window frees up.
+  const slackRefetchRef = useRef({ last: {}, pending: {} });
   async function refetchSlackChannel(accountId, channelId) {
     if (!BACKEND) return;
+    const t = slackRefetchRef.current;
+    const since = Date.now() - (t.last[accountId] || 0);
+    if (since < 55_000) {
+      if (!t.pending[accountId]) {
+        t.pending[accountId] = setTimeout(() => {
+          delete t.pending[accountId];
+          refetchSlackChannel(accountId, channelId);
+        }, 55_000 - since);
+      }
+      return;
+    }
+    t.last[accountId] = Date.now();
     try {
       const messages = await liveSlackService.listMessages(accountId, channelId);
       setWorkspaces((prev) =>
         prev.map((w) =>
           w.id === accountId
-            ? { ...w, channels: w.channels.map((c) => (c.id === channelId ? { ...c, messages } : c)) }
+            ? {
+                ...w,
+                channels: w.channels.map((c) => {
+                  if (c.id !== channelId) return c;
+                  // Carry over any already-loaded thread replies so an open
+                  // thread pane doesn't blank out when the channel refreshes.
+                  const prevReplies = new Map((c.messages || []).map((m) => [m.id, m.replies]));
+                  return {
+                    ...c,
+                    messages: messages.map((m) => ({ ...m, replies: prevReplies.get(m.id) || m.replies || [] })),
+                  };
+                }),
+              }
             : w
         )
       );
@@ -1262,25 +1449,31 @@ export default function Beacon() {
       setOpenThreadId(null);
     } else if (org) {
       const firstTeam = org.teams[0];
-      setTeamsSel({
-        teamId: firstTeam?.id ?? null,
-        channelId: firstTeam?.channels[0]?.id ?? null,
-        chatId: null,
-      });
+      if (firstTeam) {
+        setTeamsSel({ teamId: firstTeam.id, channelId: firstTeam.channels[0]?.id ?? null, chatId: null });
+      } else {
+        // Chats-only org (live Teams): land on the first chat.
+        setTeamsSel({ teamId: null, channelId: null, chatId: org.chats?.[0]?.id ?? null });
+      }
     } else {
       setActiveFolder("inbox");
     }
   }
 
-  // Fetch a channel's history and store it on the workspace. Sets messages to
-  // [] on failure so the stream shows an empty state instead of an endless
-  // spinner. Guarded by an in-flight set so the click handler and the
-  // auto-load effect can't double-fetch the same channel.
+  // Fetch a channel's history and store it on the workspace. Slack limits
+  // history to ~1 call/minute, so a rate-limited fetch keeps the loading state
+  // and schedules an automatic retry (the backend serves cached messages when
+  // it has them, so this only happens for never-viewed channels). Only a
+  // genuine non-rate-limit failure shows the empty state. Guarded by an
+  // in-flight set so click handler + auto-load effect can't double-fetch.
   const channelLoadRef = useRef(new Set());
   async function loadChannelMessages(accountId, channelId) {
     const key = `${accountId}:${channelId}`;
     if (channelLoadRef.current.has(key)) return;
     channelLoadRef.current.add(key);
+    // Interactive opens spend the same per-workspace history budget the
+    // background refetch throttle tracks — record it so they don't collide.
+    slackRefetchRef.current.last[accountId] = Date.now();
     try {
       const messages = await liveSlackService.listMessages(accountId, channelId);
       setWorkspaces((prev) =>
@@ -1291,14 +1484,20 @@ export default function Beacon() {
         )
       );
     } catch (e) {
-      console.warn("Failed to load channel:", e.message);
-      setWorkspaces((prev) =>
-        prev.map((w) =>
-          w.id === accountId
-            ? { ...w, channels: w.channels.map((c) => (c.id === channelId && c.messages == null ? { ...c, messages: [] } : c)) }
-            : w
-        )
-      );
+      if (e.status === 429) {
+        const wait = Math.min((e.retryAfter || 60) + 2, 90) * 1000;
+        console.warn(`Slack history rate-limited; retrying ${channelId} in ${wait / 1000}s`);
+        setTimeout(() => loadChannelMessages(accountId, channelId), wait);
+      } else {
+        console.warn("Failed to load channel:", e.message);
+        setWorkspaces((prev) =>
+          prev.map((w) =>
+            w.id === accountId
+              ? { ...w, channels: w.channels.map((c) => (c.id === channelId && c.messages == null ? { ...c, messages: [] } : c)) }
+              : w
+          )
+        );
+      }
     } finally {
       channelLoadRef.current.delete(key);
     }
@@ -1338,38 +1537,55 @@ export default function Beacon() {
     );
   }
 
-  async function openSlackThread(messageId) {
-    // Live mode: pull the thread's replies before showing the pane.
-    if (BACKEND && activeChannel) {
-      try {
-        const thread = await liveSlackService.listReplies(activeAccountId, activeChannel.id, messageId);
-        const replies = thread.slice(1); // [0] is the parent
-        setWorkspaces((prev) =>
-          prev.map((w) =>
-            w.id === activeAccountId
-              ? {
-                  ...w,
-                  channels: w.channels.map((c) =>
-                    c.id === activeChannel.id
-                      ? { ...c, messages: (c.messages || []).map((m) => (m.id === messageId ? { ...m, replies } : m)) }
-                      : c
-                  ),
-                }
-              : w
-          )
-        );
-      } catch (e) {
-        console.warn("Failed to load thread:", e.message);
-      }
+  // Fetch a thread's replies and store them on the parent message. Shared by
+  // opening a thread and by live-refreshing an already-open thread.
+  async function loadThreadReplies(accountId, channelId, messageId) {
+    if (!BACKEND) return;
+    try {
+      const thread = await liveSlackService.listReplies(accountId, channelId, messageId);
+      const replies = thread.slice(1); // [0] is the parent
+      setWorkspaces((prev) =>
+        prev.map((w) =>
+          w.id === accountId
+            ? {
+                ...w,
+                channels: w.channels.map((c) =>
+                  c.id === channelId
+                    ? { ...c, messages: (c.messages || []).map((m) => (m.id === messageId ? { ...m, replies } : m)) }
+                    : c
+                ),
+              }
+            : w
+        )
+      );
+    } catch (e) {
+      console.warn("Failed to load thread:", e.message);
     }
+  }
+
+  async function openSlackThread(messageId) {
+    // Live mode: pull the thread's replies before showing the pane. Works even
+    // for a message with no replies yet — that's how you start a new thread.
+    if (activeChannel) await loadThreadReplies(activeAccountId, activeChannel.id, messageId);
     setOpenThreadId(messageId);
   }
 
-  function sendSlackMessage(text) {
+  // Open a thread from the all-threads "Threads" view: jump into its channel
+  // (loading the thread's replies for that channel) and reveal the thread pane.
+  async function openThreadInChannel(channelId, messageId) {
+    setActiveChannelId(channelId);
+    if (BACKEND) await loadThreadReplies(activeAccountId, channelId, messageId);
+    setOpenThreadId(messageId);
+  }
+
+  // `text` is the Slack wire format (mentions as <@U123>); `display` is the
+  // human-readable copy for the optimistic local echo (mentions as tokens the
+  // renderer styles). They're identical when no mentions were used.
+  function sendSlackMessage(text, display = text) {
     if (!text.trim() || !activeChannel) return;
     if (BACKEND) liveSlackService.postMessage(activeAccountId, activeChannel.id, text).catch((e) => console.warn(e.message));
     else slackService.postMessage(activeChannel.id, text);
-    const newMsg = smsg(activeWorkspace.you, text, { time: "now" });
+    const newMsg = smsg(activeWorkspace.you, display, { time: "now" });
     setWorkspaces((prev) =>
       prev.map((w) =>
         w.id === activeAccountId
@@ -1384,11 +1600,11 @@ export default function Beacon() {
     );
   }
 
-  function sendSlackReply(parentId, text) {
+  function sendSlackReply(parentId, text, display = text) {
     if (!text.trim() || !activeChannel) return;
     if (BACKEND) liveSlackService.postMessage(activeAccountId, activeChannel.id, text, parentId).catch((e) => console.warn(e.message));
     else slackService.postReply(activeChannel.id, parentId, text);
-    const reply = smsg(activeWorkspace.you, text, { time: "now" });
+    const reply = smsg(activeWorkspace.you, display, { time: "now" });
     setWorkspaces((prev) =>
       prev.map((w) =>
         w.id === activeAccountId
@@ -1508,19 +1724,61 @@ export default function Beacon() {
     );
   }
 
+  // Live mode: fetch a Teams chat's messages the first time it's opened.
+  const teamsChatLoadRef = useRef(new Set());
+  async function loadTeamsChatMessages(accountId, chatId) {
+    const key = `${accountId}:${chatId}`;
+    if (teamsChatLoadRef.current.has(key)) return;
+    teamsChatLoadRef.current.add(key);
+    try {
+      const messages = await liveTeamsService.listChatMessages(accountId, chatId);
+      setTeamsOrgs((prev) =>
+        prev.map((o) =>
+          o.id === accountId
+            ? { ...o, chats: (o.chats || []).map((c) => (c.id === chatId ? { ...c, messages } : c)) }
+            : o
+        )
+      );
+    } catch (e) {
+      console.warn("Failed to load Teams chat:", e.message);
+      setTeamsOrgs((prev) =>
+        prev.map((o) =>
+          o.id === accountId
+            ? { ...o, chats: (o.chats || []).map((c) => (c.id === chatId && c.messages == null ? { ...c, messages: [] } : c)) }
+            : o
+        )
+      );
+    } finally {
+      teamsChatLoadRef.current.delete(key);
+    }
+  }
+
   function openTeamsChat(chatId) {
     setTeamsSel({ teamId: null, channelId: null, chatId });
+    if (BACKEND) {
+      const org = teamsOrgs.find((o) => o.id === activeAccountId);
+      const chat = (org?.chats || []).find((c) => c.id === chatId);
+      if (chat && chat.messages == null) loadTeamsChatMessages(activeAccountId, chatId);
+    }
     updateTeamsChat(chatId, (c) => ({ ...c, unread: 0 }));
   }
 
+  // Load the visible Teams chat's history if not yet fetched — covers the chat
+  // selectItem lands on when an org is first opened (same pattern as Slack).
+  useEffect(() => {
+    if (!BACKEND || !activeTeamsOrg || !activeTeamsChannel?.chat) return;
+    if (activeTeamsChannel.chat.messages == null) {
+      loadTeamsChatMessages(activeTeamsOrg.id, activeTeamsChannel.chat.id);
+    }
+  }, [activeTeamsOrg?.id, activeTeamsChannel?.chat?.id, activeTeamsChannel?.chat?.messages]);
+
   function sendTeamsChat(text) {
     if (!text.trim() || !activeTeamsChannel?.chat) return;
-    teamsService.postMessage(activeTeamsChannel.chat.id, text);
+    const chatId = activeTeamsChannel.chat.id;
+    if (BACKEND) liveTeamsService.sendChat(activeAccountId, chatId, text).catch((e) => console.warn(e.message));
+    else teamsService.postMessage(chatId, text);
     const msg = tpost(activeTeamsOrg.you, text, { time: "now" });
-    updateTeamsChat(activeTeamsChannel.chat.id, (c) => ({
-      ...c,
-      messages: [...c.messages, msg],
-    }));
+    updateTeamsChat(chatId, (c) => ({ ...c, messages: [...(c.messages || []), msg] }));
   }
 
   function sendTeamsPost(text) {
@@ -1594,6 +1852,20 @@ export default function Beacon() {
     }));
   }
 
+  // Optimistically adjust the live unread badge for a folder. In live mode the
+  // badges read the backend poller's counts (liveUnread), which only refresh
+  // every ~15s — without this, reading/deleting/marking mail leaves the bubble
+  // stale until the next poll. The poller still reconciles to the true count.
+  function bumpLiveUnread(accountId, folder, delta) {
+    if (!BACKEND || !delta) return;
+    setLiveUnread((prev) => {
+      const acc = prev[accountId];
+      if (!acc) return prev;
+      const f = folder || "inbox";
+      return { ...prev, [accountId]: { ...acc, [f]: Math.max(0, (acc[f] || 0) + delta) } };
+    });
+  }
+
   function openMessage(m) {
     setSelectedId(m.id);
     // Live mode: pull the full body if the list row only has a preview.
@@ -1614,6 +1886,7 @@ export default function Beacon() {
     if (m.unread) {
       if (BACKEND) liveMailService.markRead(activeAccountId, m.id, true, m.folder || activeFolder).catch(() => {});
       else mailService.markRead(m.id);
+      bumpLiveUnread(activeAccountId, m.folder || activeFolder, -1);
       setAccounts((prev) =>
         prev.map((a) =>
           a.id === activeAccountId
@@ -1650,7 +1923,9 @@ export default function Beacon() {
         setAppleForm({ address: "", appPassword: "", error: null });
         return;
       }
-      if (provider === "teams") return; // button disabled in live mode
+      // Teams is parked until a tenant admin approves the Graph chat scopes —
+      // the button shows "coming soon" and is disabled in live mode.
+      if (provider === "teams") return;
     }
     setConnecting(provider);
     if (provider === "slack") {
@@ -1723,6 +1998,11 @@ export default function Beacon() {
     if (BACKEND) {
       liveMailService.move(activeAccountId, m.id, dest, m.folder || activeFolder).catch((e) => console.warn(e.message));
     }
+    // An unread message leaving its folder takes its badge count with it.
+    if (m.unread) {
+      bumpLiveUnread(activeAccountId, m.folder || activeFolder, -1);
+      bumpLiveUnread(activeAccountId, dest, +1);
+    }
     setAccounts((prev) =>
       prev.map((a) =>
         a.id === activeAccountId
@@ -1739,6 +2019,7 @@ export default function Beacon() {
     } else {
       mailService.markRead(m.id);
     }
+    if (m.unread === read) bumpLiveUnread(activeAccountId, m.folder || activeFolder, read ? -1 : +1);
     setAccounts((prev) =>
       prev.map((a) =>
         a.id === activeAccountId
@@ -1801,7 +2082,10 @@ export default function Beacon() {
   }
 
   return (
-    <div className={`md-root ${railExpanded ? "rail-open" : ""}`}>
+    <div
+      className={`md-root ${railExpanded ? "rail-open" : ""} ${isSlack ? "is-slack" : ""}`}
+      style={{ "--sl-side-w": `${slackSideW}px`, "--sl-thread-w": `${slackThreadW}px` }}
+    >
       <style>{CSS}</style>
       {BACKEND && !profileLoaded && (
         <div className="auth-overlay"><div className="auth-splash">Loading Beacon…</div></div>
@@ -1883,6 +2167,7 @@ export default function Beacon() {
 
           {workspaces.map((w) => {
             const unread = unreadByWorkspace[w.id] || 0;
+            const dm = dmUnreadByWorkspace[w.id] || 0;
             const active = w.id === activeAccountId;
             return (
               <button
@@ -1905,11 +2190,15 @@ export default function Beacon() {
                   </span>
                 )}
 
-                {unread > 0 && (
+                {/* mail-style badge = messages aimed at you (DMs/mentions);
+                    plain dot = there's channel activity, nothing personal */}
+                {dm > 0 ? (
                   <span className={`rail-dot ${railExpanded ? "inline" : ""}`}>
-                    {unread > 9 ? "9+" : unread}
+                    {dm > 9 ? "9+" : dm}
                   </span>
-                )}
+                ) : unread > 0 ? (
+                  <span className={`rail-dot activity ${railExpanded ? "inline" : ""}`} title="New channel messages" />
+                ) : null}
               </button>
             );
           })}
@@ -2008,6 +2297,9 @@ export default function Beacon() {
             workspace={activeWorkspace}
             activeChannel={activeChannel}
             onOpenChannel={openChannel}
+            activeThreadsView={activeChannelId === THREADS_VIEW_ID}
+            onOpenThreadsView={() => { setActiveChannelId(THREADS_VIEW_ID); setOpenThreadId(null); }}
+            onSideResize={startSideResize}
             editingLabel={editingLabel}
             onEditLabel={setEditingLabel}
             onSaveLabel={saveLabel}
@@ -2124,6 +2416,8 @@ export default function Beacon() {
           profile={profile}
           loading={loading}
         />
+      ) : isSlack && activeChannelId === THREADS_VIEW_ID ? (
+        <SlackThreadsView threads={allThreads} onOpen={openThreadInChannel} />
       ) : isSlack ? (
         <SlackView
           workspace={activeWorkspace}
@@ -2134,6 +2428,8 @@ export default function Beacon() {
           onSend={sendSlackMessage}
           onReply={sendSlackReply}
           onReact={toggleReaction}
+          onThreadResize={startThreadResize}
+          members={slackMembers}
           loading={loading}
         />
       ) : isTeams ? (
@@ -2304,6 +2600,7 @@ export default function Beacon() {
           ) : (
           <div className="provider-grid">
             {Object.entries(PROVIDERS).map(([key, p]) => {
+              // Teams needs tenant-admin consent for its Graph scopes; parked.
               const teamsDisabled = !!BACKEND && key === "teams";
               return (
               <button
@@ -3148,7 +3445,12 @@ function TeamsView({ org, selection, onSend, onSendChat, onReply, onReact, loadi
         </header>
 
         <div className="tm-stream tm-chat-stream">
-          {chat.messages.map((m) => {
+          {chat.messages == null ? (
+            <div className="empty"><RefreshCw size={22} className="spin" /><p>Loading chat…</p></div>
+          ) : chat.messages.length === 0 ? (
+            <div className="empty"><MessageSquare size={40} strokeWidth={1.3} /><p>No messages yet</p></div>
+          ) : (
+          chat.messages.map((m) => {
             const mine = m.author === org.you;
             return (
               <div className={`tm-bubble-row ${mine ? "mine" : ""}`} key={m.id}>
@@ -3167,7 +3469,8 @@ function TeamsView({ org, selection, onSend, onSendChat, onReply, onReact, loadi
                 </div>
               </div>
             );
-          })}
+          })
+          )}
         </div>
 
         <div className="tm-composer">
@@ -3250,12 +3553,13 @@ function TeamsView({ org, selection, onSend, onSendChat, onReply, onReact, loadi
 }
 
 /* ---- Slack: channel sidebar ---- */
-function SlackChannelList({ workspace, activeChannel, onOpenChannel, editingLabel, onEditLabel, onSaveLabel, onGoHome }) {
+function SlackChannelList({ workspace, activeChannel, onOpenChannel, activeThreadsView, onOpenThreadsView, onSideResize, editingLabel, onEditLabel, onSaveLabel, onGoHome }) {
   // "active" mirrors Slack's default sidebar: conversations with unread or
   // activity in the last 30 days (the backend flags these). "all" shows
   // everything. Mock channels have no `active` field, so they always show.
   const [filter, setFilter] = useState("active");
-  const isVisible = (c) => filter === "all" || c.active !== false;
+  // Anything with unread is always visible, whatever its activity flag says.
+  const isVisible = (c) => filter === "all" || c.active !== false || c.unread > 0;
   const visible = workspace.channels.filter(isVisible);
   const channels = visible.filter((c) => c.kind === "channel");
   const dms = visible.filter((c) => c.kind === "dm");
@@ -3303,6 +3607,14 @@ function SlackChannelList({ workspace, activeChannel, onOpenChannel, editingLabe
       </div>
 
       <div className="sl-groups">
+        <button
+          className={`sl-chan sl-threads-link ${activeThreadsView ? "is-active" : ""}`}
+          onClick={onOpenThreadsView}
+        >
+          <MessageSquare size={15} />
+          <span className="sl-chan-name">Threads</span>
+        </button>
+
         <div className="sl-group">
           <span className="sl-group-title">Channels</span>
           {channels.map((c) => (
@@ -3313,7 +3625,9 @@ function SlackChannelList({ workspace, activeChannel, onOpenChannel, editingLabe
             >
               <span className="sl-hash">#</span>
               <span className="sl-chan-name">{c.name}</span>
-              {c.unread > 0 && <span className="sl-badge">{c.unread}</span>}
+              {/* channel activity: bold name + dot — the numeric badge is
+                  reserved for DMs/mentions, matching Slack's own semantics */}
+              {c.unread > 0 && <span className="sl-unread-dot" title={`${c.unread} new`} />}
             </button>
           ))}
         </div>
@@ -3338,33 +3652,97 @@ function SlackChannelList({ workspace, activeChannel, onOpenChannel, editingLabe
         <span className="prov-tag" style={{ background: PROVIDERS.slack.gradient }}>S</span>
         Slack workspace
       </div>
+
+      {onSideResize && (
+        <div className="sl-side-resize" onPointerDown={onSideResize} title="Drag to resize" />
+      )}
     </div>
   );
 }
 
-/* ---- Slack: message list + optional thread pane ---- */
-function SlackView({ workspace, channel, openThread, onOpenThread, onCloseThread, onSend, onReply, onReact, loading }) {
+/* ---- Slack: all-threads view ---- */
+function SlackThreadsView({ threads, onOpen }) {
+  return (
+    <section className="sl-content">
+      <div className="sl-main">
+        <header className="sl-chan-head">
+          <div className="sl-chan-head-title">
+            <MessageSquare size={18} />
+            <h1>Threads</h1>
+          </div>
+          <span className="sl-chan-meta">Threads you're following</span>
+        </header>
+
+        <div className="sl-stream">
+          {threads.length === 0 ? (
+            <div className="empty">
+              <MessageSquare size={40} strokeWidth={1.3} />
+              <p>No threads yet</p>
+              <span className="sl-threads-hint">Reply in a thread from any channel and it shows up here.</span>
+            </div>
+          ) : (
+            threads.map((t) => {
+              const p = t.parent;
+              const replyN = p.replies?.length || p.replyCount || 0;
+              return (
+                <button
+                  key={`${t.channelId}:${p.id}`}
+                  className="sl-thread-item"
+                  onClick={() => onOpen(t.channelId, p.id)}
+                >
+                  <div className="sl-thread-item-chan">
+                    {t.channelKind === "channel" ? "#" : ""}{t.channelName}
+                  </div>
+                  <div className="sl-thread-item-row">
+                    <span className="sl-avatar" style={{ background: avatarColor(p.author) }}>
+                      {p.author.split(" ").map((s) => s[0]).slice(0, 2).join("")}
+                    </span>
+                    <div className="sl-thread-item-body">
+                      <div className="sl-msg-head">
+                        <span className="sl-author">{p.author}</span>
+                        <span className="sl-time">{p.time}</span>
+                      </div>
+                      <div className="sl-text sl-thread-item-text">{renderSlackText(p.text)}</div>
+                      <span className="sl-thread-item-count" style={{ color: "var(--accent)" }}>
+                        {replyN} {replyN === 1 ? "reply" : "replies"} · View thread
+                      </span>
+                    </div>
+                  </div>
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* ---- Slack: message pane (fills the space) + optional slide-in thread pane ---- */
+function SlackView({ workspace, channel, openThread, onOpenThread, onCloseThread, onSend, onReply, onReact, onThreadResize, members, loading }) {
   if (loading) {
     return (
-      <section className="list">
-        <div className="empty">Loading workspace…</div>
+      <section className="sl-content">
+        <div className="sl-main"><div className="empty">Loading workspace…</div></div>
       </section>
     );
   }
   if (!channel) {
     return (
-      <section className="reader">
-        <div className="reader-empty">
-          <Mail size={48} strokeWidth={1.1} />
-          <p>No channel selected</p>
+      <section className="sl-content">
+        <div className="sl-main">
+          <div className="reader-empty">
+            <Mail size={48} strokeWidth={1.1} />
+            <p>No channel selected</p>
+          </div>
         </div>
       </section>
     );
   }
 
   return (
-    <>
-      <section className="list sl-main">
+    <section className="sl-content">
+      <div className="sl-main">
         <header className="sl-chan-head">
           <div className="sl-chan-head-title">
             {channel.kind === "channel" ? <span className="sl-hash big">#</span> : null}
@@ -3401,29 +3779,28 @@ function SlackView({ workspace, channel, openThread, onOpenThread, onCloseThread
         </div>
 
         <SlackComposer placeholder={`Message ${channel.kind === "channel" ? "#" + channel.name : channel.name}`}
-          onSend={onSend} />
-      </section>
+          onSend={onSend} members={members} />
+      </div>
 
-      <section className="reader sl-thread-pane">
-        {openThread ? (
-          <SlackThread
-            parent={openThread}
-            you={workspace.you}
-            accent={workspace.accent}
-            channelName={channel.name}
-            channelKind={channel.kind}
-            onClose={onCloseThread}
-            onReply={(text) => onReply(openThread.id, text)}
-            onReact={onReact}
-          />
-        ) : (
-          <div className="reader-empty">
-            <Reply size={44} strokeWidth={1.1} />
-            <p>Open a thread to see replies</p>
-          </div>
-        )}
-      </section>
-    </>
+      {openThread && (
+        <>
+          <div className="sl-pane-resize" onPointerDown={onThreadResize} title="Drag to resize" />
+          <aside className="sl-thread-pane" style={{ width: "var(--sl-thread-w, 420px)" }}>
+            <SlackThread
+              parent={openThread}
+              you={workspace.you}
+              accent={workspace.accent}
+              channelName={channel.name}
+              channelKind={channel.kind}
+              onClose={onCloseThread}
+              onReply={(text, display) => onReply(openThread.id, text, display)}
+              onReact={onReact}
+              members={members}
+            />
+          </aside>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -3438,8 +3815,14 @@ function SlackMessage({ m, accent, onOpenThread, onReact, compact }) {
     setPicking(false);
   };
 
+  const reactions = m.reactions || [];
+  const replyN = m.replies?.length || m.replyCount || 0;
+  // Reply-in-thread is offered on main-stream messages (not on replies already
+  // inside a thread, which is the `compact` rendering).
+  const canThread = !compact && onOpenThread;
+
   return (
-    <div className={`sl-msg ${compact ? "compact" : ""}`}>
+    <div className={`sl-msg ${compact ? "compact" : ""} ${m.mentionsMe ? "mentions-me" : ""}`}>
       <span className="sl-avatar" style={{ background: avatarColor(m.author) }}>
         {m.author.split(" ").map((s) => s[0]).slice(0, 2).join("")}
       </span>
@@ -3448,12 +3831,12 @@ function SlackMessage({ m, accent, onOpenThread, onReact, compact }) {
           <span className="sl-author">{m.author}</span>
           <span className="sl-time">{m.time}</span>
         </div>
-        <div className="sl-text">{m.text}</div>
+        <div className="sl-text">{renderSlackText(m.text)}</div>
 
-        {/* reactions row: existing chips (clickable to toggle) + add button */}
-        {(m.reactions?.length > 0 || true) && (
+        {/* existing reactions (clickable to toggle); shown only when present */}
+        {reactions.length > 0 && (
           <div className="sl-reactions">
-            {(m.reactions || []).map((r, i) => (
+            {reactions.map((r, i) => (
               <button
                 key={i}
                 className={`sl-reaction ${r.mine ? "mine" : ""}`}
@@ -3464,47 +3847,56 @@ function SlackMessage({ m, accent, onOpenThread, onReact, compact }) {
                 <span className="sl-reaction-count">{r.count}</span>
               </button>
             ))}
-
-            <div className="sl-react-add-wrap">
-              <button
-                className="sl-react-add"
-                onClick={() => setPicking((v) => !v)}
-                aria-label="Add reaction"
-                title="Add reaction"
-              >
-                <SmilePlus size={15} />
-              </button>
-              {picking && (
-                <>
-                  <div className="sl-emoji-backdrop" onClick={() => setPicking(false)} />
-                  <div className="sl-emoji-pop" role="menu">
-                    {QUICK_EMOJI.map((e) => (
-                      <button
-                        key={e}
-                        className="sl-emoji-opt"
-                        onClick={() => addReaction(e)}
-                      >
-                        {e}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
           </div>
         )}
 
-        {!compact && ((m.replies?.length || 0) > 0 || (m.replyCount || 0) > 0) && (
+        {canThread && replyN > 0 && (
           <button className="sl-thread-link" onClick={onOpenThread} style={{ color: accent }}>
             <span className="sl-thread-avatars">
-              {m.replies.slice(0, 3).map((r, i) => (
+              {(m.replies || []).slice(0, 3).map((r, i) => (
                 <span key={i} className="sl-thread-av" style={{ background: avatarColor(r.author) }}>
                   {r.author[0]}
                 </span>
               ))}
             </span>
-            {m.replies?.length || m.replyCount} {(m.replies?.length || m.replyCount) === 1 ? "reply" : "replies"}
+            {replyN} {replyN === 1 ? "reply" : "replies"}
             <span className="sl-thread-last">View thread</span>
+          </button>
+        )}
+      </div>
+
+      {/* hover toolbar — react on any message, reply-in-thread on main messages */}
+      <div className="sl-msg-actions">
+        <div className="sl-react-add-wrap">
+          <button
+            className="sl-act-btn"
+            onClick={() => setPicking((v) => !v)}
+            aria-label="Add reaction"
+            title="Add reaction"
+          >
+            <SmilePlus size={16} />
+          </button>
+          {picking && (
+            <>
+              <div className="sl-emoji-backdrop" onClick={() => setPicking(false)} />
+              <div className="sl-emoji-pop right" role="menu">
+                {QUICK_EMOJI.map((e) => (
+                  <button key={e} className="sl-emoji-opt" onClick={() => addReaction(e)}>
+                    {e}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+        {canThread && (
+          <button
+            className="sl-act-btn"
+            onClick={onOpenThread}
+            aria-label="Reply in thread"
+            title="Reply in thread"
+          >
+            <MessageSquare size={16} />
           </button>
         )}
       </div>
@@ -3512,7 +3904,8 @@ function SlackMessage({ m, accent, onOpenThread, onReact, compact }) {
   );
 }
 
-function SlackThread({ parent, you, accent, channelName, channelKind, onClose, onReply, onReact }) {
+function SlackThread({ parent, you, accent, channelName, channelKind, onClose, onReply, onReact, members }) {
+  const replies = parent.replies || [];
   return (
     <>
       <div className="sl-thread-head">
@@ -3530,37 +3923,121 @@ function SlackThread({ parent, you, accent, channelName, channelKind, onClose, o
       <div className="sl-thread-scroll">
         <SlackMessage m={parent} accent={accent} onReact={onReact} compact />
         <div className="sl-thread-divider">
-          {parent.replies.length} {parent.replies.length === 1 ? "reply" : "replies"}
+          {replies.length > 0
+            ? `${replies.length} ${replies.length === 1 ? "reply" : "replies"}`
+            : "No replies yet"}
         </div>
-        {parent.replies.map((r) => (
+        {replies.map((r) => (
           <SlackMessage key={r.id} m={r} accent={accent} onReact={onReact} compact />
         ))}
       </div>
 
-      <SlackComposer placeholder="Reply…" onSend={onReply} />
+      <SlackComposer placeholder={`Reply to ${channelKind === "channel" ? "#" + channelName : channelName}…`} onSend={onReply} autoFocus members={members} />
     </>
   );
 }
 
-function SlackComposer({ placeholder, onSend }) {
+function SlackComposer({ placeholder, onSend, autoFocus, members = [] }) {
   const [text, setText] = useState("");
+  // Active "@query" being typed (null = no autocomplete open) + highlighted row.
+  const [mQuery, setMQuery] = useState(null);
+  const [mIndex, setMIndex] = useState(0);
+  // Names picked from the autocomplete → user ids, so submit() can convert the
+  // human-readable "@Display Name" back into Slack's <@U123> wire format.
+  const mentionMap = useRef(new Map());
+  const ref = useRef(null);
+  useEffect(() => { if (autoFocus) ref.current?.focus(); }, [autoFocus]);
+
+  const matches = useMemo(() => {
+    if (mQuery == null) return [];
+    const q = mQuery.toLowerCase();
+    return members.filter((u) => u.name.toLowerCase().includes(q)).slice(0, 6);
+  }, [mQuery, members]);
+
+  // Look backwards from the caret for an in-progress "@word" token.
+  const detectMention = (value, caret) => {
+    const upto = value.slice(0, caret);
+    const m = upto.match(/(^|\s)@([\w.\- ]{0,30})$/);
+    // Allow spaces (display names have them) but stop matching once the query
+    // can't match anyone — otherwise the popup lingers over normal typing.
+    setMQuery(m ? m[2] : null);
+    setMIndex(0);
+  };
+
+  const pick = (user) => {
+    const el = ref.current;
+    const caret = el ? el.selectionStart : text.length;
+    const before = text.slice(0, caret).replace(/@([\w.\- ]{0,30})$/, `@${user.name} `);
+    setText(before + text.slice(caret));
+    mentionMap.current.set(user.name, user.id);
+    setMQuery(null);
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(before.length, before.length);
+    });
+  };
+
   const submit = () => {
     if (!text.trim()) return;
-    onSend(text);
+    // Convert picked mentions: api text gets <@id>, the display copy (used for
+    // the optimistic local echo) gets the same styled token the backend emits.
+    let api = text;
+    let display = text;
+    const entries = [...mentionMap.current.entries()].sort((a, b) => b[0].length - a[0].length);
+    for (const [name, id] of entries) {
+      const re = new RegExp(`@${escapeRegExp(name)}(?=$|[\\s.,!?:;])`, "g");
+      api = api.replace(re, `<@${id}>`);
+      display = display.replace(re, `{{@${id}|${name}}}`);
+    }
+    onSend(api, display);
     setText("");
+    setMQuery(null);
+    mentionMap.current.clear();
   };
+
+  const onKeyDown = (e) => {
+    if (matches.length > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setMIndex((i) => (i + 1) % matches.length); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setMIndex((i) => (i - 1 + matches.length) % matches.length); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pick(matches[mIndex]); return; }
+      if (e.key === "Escape") { setMQuery(null); return; }
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+    }
+  };
+
   return (
     <div className="sl-composer">
+      {matches.length > 0 && (
+        <div className="sl-mention-pop" role="listbox">
+          {matches.map((u, i) => (
+            <button
+              key={u.id}
+              role="option"
+              aria-selected={i === mIndex}
+              className={`sl-mention-opt ${i === mIndex ? "is-active" : ""}`}
+              onMouseDown={(e) => { e.preventDefault(); pick(u); }}
+              onMouseEnter={() => setMIndex(i)}
+            >
+              <span className="sl-mention-av" style={{ background: avatarColor(u.name) }}>
+                {u.name.split(" ").map((s) => s[0]).slice(0, 2).join("")}
+              </span>
+              {u.name}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="sl-composer-box">
         <textarea
+          ref={ref}
           value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              submit();
-            }
+          onChange={(e) => {
+            setText(e.target.value);
+            detectMention(e.target.value, e.target.selectionStart);
           }}
+          onKeyDown={onKeyDown}
           placeholder={placeholder}
           rows={1}
         />
@@ -3942,6 +4419,11 @@ const CSS = `
   transition:grid-template-columns .22s cubic-bezier(.4,0,.2,1);
 }
 .md-root.rail-open{grid-template-columns:248px 232px 360px 1fr}
+/* Slack uses 3 columns: rail, a resizable channel sidebar, and one content
+   column that holds the message pane + slide-in thread pane (both flex, so the
+   messages fill the space until a thread opens). */
+.md-root.is-slack{grid-template-columns:64px var(--sl-side-w,232px) 1fr}
+.md-root.is-slack.rail-open{grid-template-columns:248px var(--sl-side-w,232px) 1fr}
 button{font-family:inherit; cursor:pointer; border:none; background:none; color:inherit}
 
 /* ---- rail ---- */
@@ -4031,6 +4513,12 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .rail-dot.inline{
   position:static; border:none; flex-shrink:0; height:19px; min-width:19px;
 }
+/* plain-activity variant: something happened in a channel, nothing aimed at you */
+.rail-dot.activity{
+  min-width:12px; width:12px; height:12px; padding:0; background:#fff;
+  border:2.5px solid var(--rail);
+}
+.rail-dot.activity.inline{border:2.5px solid var(--line); background:var(--ink-3)}
 
 .rail-add{
   width:44px; height:44px; border-radius:50%; border:1.5px dashed #44506a; color:#aab4c6;
@@ -4347,9 +4835,27 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
   border-radius:9px; padding:0 5px; display:grid; place-items:center; flex-shrink:0;
 }
 .sl-chan.is-active .sl-badge{background:rgba(255,255,255,.25)}
+/* channel-activity indicator: unread channels get bold text + this dot; the
+   red numeric badge is reserved for DMs (messages aimed at you) */
+.sl-unread-dot{width:9px; height:9px; border-radius:50%; background:var(--accent); flex-shrink:0}
+.sl-chan.is-active .sl-unread-dot{background:#fff}
 
-/* ===== Slack: main message pane ===== */
-.sl-main{display:flex; flex-direction:column}
+/* ===== Slack: content area (message pane + slide-in thread pane) ===== */
+.sl-content{grid-column:3; display:flex; min-width:0; overflow:hidden}
+.sl-main{flex:1; min-width:0; display:flex; flex-direction:column; background:var(--panel)}
+/* draggable divider between the message pane and the thread pane */
+.sl-pane-resize{
+  flex-shrink:0; width:6px; cursor:col-resize; background:var(--line-2);
+  border-left:1px solid var(--line); border-right:1px solid var(--line); transition:background .12s;
+}
+.sl-pane-resize:hover{background:var(--accent-soft)}
+/* draggable edge on the channel sidebar */
+.sl-side{position:relative}
+.sl-side-resize{
+  position:absolute; top:0; right:0; width:6px; height:100%; cursor:col-resize; z-index:20;
+  transition:background .12s;
+}
+.sl-side-resize:hover{background:var(--accent-soft)}
 .sl-chan-head{
   padding:14px 22px; border-bottom:1px solid var(--line); display:flex;
   flex-direction:column; gap:2px;
@@ -4359,9 +4865,22 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .sl-chan-meta{font-size:12px; color:var(--ink-3)}
 
 .sl-stream{flex:1; overflow-y:auto; padding:16px 0}
-.sl-msg{display:flex; gap:11px; padding:7px 22px; transition:background .1s}
+.sl-msg{position:relative; display:flex; gap:11px; padding:7px 22px; transition:background .1s}
 .sl-msg:hover{background:#fafbfc}
 .sl-msg.compact{padding:7px 20px}
+/* hover action toolbar, floating at the message's top-right like Slack */
+.sl-msg-actions{
+  position:absolute; top:-12px; right:18px; display:none; gap:2px; z-index:5;
+  background:var(--panel); border:1px solid var(--line); border-radius:9px;
+  box-shadow:var(--shadow); padding:2px;
+}
+.sl-msg:hover .sl-msg-actions{display:flex}
+.sl-act-btn{
+  width:30px; height:28px; border-radius:7px; display:grid; place-items:center;
+  color:var(--ink-2); transition:.1s;
+}
+.sl-act-btn:hover{background:var(--line-2); color:var(--ink)}
+.sl-emoji-pop.right{left:auto; right:0}
 .sl-avatar{
   width:38px; height:38px; border-radius:9px; flex-shrink:0; display:grid; place-items:center;
   color:#fff; font-weight:600; font-size:14px;
@@ -4372,6 +4891,17 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .sl-author{font-weight:700; font-size:14px; color:var(--ink)}
 .sl-time{font-size:11px; color:var(--ink-3)}
 .sl-text{font-size:14px; line-height:1.5; color:#2c3138; margin-top:1px; white-space:pre-wrap; word-break:break-word}
+/* @mentions, #channel refs, and links inside message text */
+.sl-mention{
+  display:inline-block; background:var(--accent-soft); color:var(--accent);
+  border-radius:4px; padding:0 3px; font-weight:600;
+}
+.sl-mention.me{background:#FDECC8; color:#B45309}
+.sl-link{color:var(--accent); text-decoration:none}
+.sl-link:hover{text-decoration:underline}
+/* a message that mentions you — Slack-style soft yellow wash */
+.sl-msg.mentions-me{background:#FEF9EC; box-shadow:inset 3px 0 0 #F2C744}
+.sl-msg.mentions-me:hover{background:#FdF3d7}
 
 .sl-reactions{display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; align-items:center}
 .sl-reaction{
@@ -4417,7 +4947,22 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .sl-thread-last{color:var(--ink-3); font-weight:500; margin-left:2px}
 
 /* composer (shared by channel + thread) */
-.sl-composer{padding:10px 18px 16px}
+.sl-composer{position:relative; padding:10px 18px 16px}
+/* @mention autocomplete, floating above the composer */
+.sl-mention-pop{
+  position:absolute; bottom:calc(100% - 2px); left:18px; right:18px; max-width:320px; z-index:31;
+  background:var(--panel); border:1px solid var(--line); border-radius:12px;
+  box-shadow:0 10px 30px rgba(16,24,40,.16); padding:4px; animation:pop .14s;
+}
+.sl-mention-opt{
+  display:flex; align-items:center; gap:9px; width:100%; padding:7px 10px;
+  border-radius:8px; font-size:13.5px; text-align:left; transition:.1s;
+}
+.sl-mention-opt.is-active{background:var(--accent-soft); color:var(--accent)}
+.sl-mention-av{
+  width:24px; height:24px; border-radius:6px; flex-shrink:0; display:grid; place-items:center;
+  color:#fff; font-size:10px; font-weight:700;
+}
 .sl-composer-box{
   display:flex; align-items:flex-end; gap:8px; border:1px solid var(--line); border-radius:11px;
   padding:8px 8px 8px 14px; background:var(--panel); box-shadow:var(--shadow);
@@ -4434,8 +4979,27 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 .sl-send:hover:not(:disabled){background:#324bc0}
 .sl-send:disabled{background:var(--line); color:var(--ink-3); cursor:default}
 
-/* ===== Slack: thread pane ===== */
-.sl-thread-pane{background:var(--panel)}
+/* ===== Slack: thread pane (slides in from the right) ===== */
+.sl-thread-pane{
+  flex-shrink:0; display:flex; flex-direction:column; min-width:0; background:var(--panel);
+  border-left:1px solid var(--line); animation:slideInRight .2s cubic-bezier(.4,0,.2,1);
+}
+@keyframes slideInRight{from{transform:translateX(24px); opacity:0} to{transform:none; opacity:1}}
+/* "Threads" sidebar entry + all-threads list */
+.sl-threads-link{margin-bottom:6px}
+.sl-threads-hint{font-size:12px; color:var(--ink-3); margin-top:4px; max-width:220px; text-align:center}
+.sl-thread-item{
+  display:block; width:100%; text-align:left; padding:12px 22px; border-bottom:1px solid var(--line-2);
+  transition:background .1s;
+}
+.sl-thread-item:hover{background:#fafbfc}
+.sl-thread-item-chan{font-size:12px; font-weight:700; color:var(--ink-2); margin-bottom:7px}
+.sl-thread-item-row{display:flex; gap:11px}
+.sl-thread-item-body{min-width:0; flex:1}
+.sl-thread-item-text{
+  overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+}
+.sl-thread-item-count{display:inline-block; margin-top:5px; font-size:13px; font-weight:600}
 .sl-thread-head{
   display:flex; align-items:center; justify-content:space-between; padding:15px 20px;
   border-bottom:1px solid var(--line);
@@ -4920,11 +5484,16 @@ button{font-family:inherit; cursor:pointer; border:none; background:none; color:
 @media (max-width:900px){
   .md-root{grid-template-columns:64px 200px 1fr}
   .md-root.rail-open{grid-template-columns:248px 200px 1fr}
+  .md-root.is-slack{grid-template-columns:64px var(--sl-side-w,200px) 1fr}
+  .md-root.is-slack.rail-open{grid-template-columns:248px var(--sl-side-w,200px) 1fr}
   /* email: keep the message list, hide the reading pane */
   .reader{display:none !important}
   .list{grid-column:3}
-  /* slack: stream fills the content column (thread pane is a .reader, hidden above) */
-  .sl-main{grid-column:3}
+  /* slack: content fills the column; the thread pane overlays instead of
+     squeezing the message pane on a narrow screen */
+  .sl-content{grid-column:3; position:relative}
+  .sl-thread-pane{position:absolute; inset:0; width:auto !important; z-index:15}
+  .sl-pane-resize{display:none}
   /* teams + home collapse their two-column span to the single content column */
   .tm-main,.home{grid-column:3 / span 1}
 }
